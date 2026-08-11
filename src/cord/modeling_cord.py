@@ -798,7 +798,7 @@ def hashlib_state_id(parent_id: str, operator: str, expansion_index: int, finger
 class CordForCausalLM(CordPreTrainedModel, GenerationMixin):
     """Prefix-causal CoRD language model with a tied output head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: CordConfig):
         super().__init__(config)
