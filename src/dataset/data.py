@@ -141,7 +141,12 @@ def _pair_prefix_tokens(pair: Pair, *, add_separator: bool) -> list[int]:
 
 
 class ARCDataset(Dataset):
-    """One prefix-causal training sample for every ARC query in supplied tasks."""
+    """Prefix-causal ARC queries with optional task-consistent train variants.
+
+    ``num_aug`` is the number of additional augmented copies per query in each
+    epoch.  Copy zero is always canonical, which keeps a non-augmented anchor
+    in the train distribution and makes validation/test protocol-independent.
+    """
 
     def __init__(
         self,
@@ -149,22 +154,29 @@ class ARCDataset(Dataset):
         *,
         max_length: int | None = None,
         augment: bool = False,
+        num_aug: int = 0,
         augmentation_seed: int = 42,
         split_name: str = "train",
     ):
         if split_name not in {"train", "validation", "test"}:
             raise ValueError("split_name must be train, validation, or test")
+        if num_aug < 0:
+            raise ValueError("num_aug must be non-negative")
+        if num_aug and split_name != "train":
+            raise ValueError("num_aug is supported only for the train split")
         self.file_paths = tuple(Path(path) for path in file_paths)
         self.max_length = max_length
         self.augment = augment
+        self.num_aug = num_aug
         self.augmentation_seed = augmentation_seed
         self.split_name = split_name
         self.epoch = 0
         self.tasks = [(task_id_from_path(path), load_arc_task(path)) for path in self.file_paths]
         self.samples = [
-            (task_id, task, query_index)
+            (task_id, task, query_index, augmentation_index)
             for task_id, task in self.tasks
             for query_index in range(len(task["test"]))
+            for augmentation_index in range(1 + (num_aug if augment and split_name == "train" else 0))
         ]
         self._validate_lengths()
 
@@ -172,20 +184,33 @@ class ARCDataset(Dataset):
         """Set the deterministic epoch component used for train augmentation."""
         self.epoch = epoch
 
-    def _task_pairs(self, task_id: str, task: dict[str, list[Pair]]) -> tuple[list[Pair], list[Pair]]:
+    def _task_pairs(
+        self,
+        task_id: str,
+        task: dict[str, list[Pair]],
+        augmentation_index: int = 0,
+    ) -> tuple[list[Pair], list[Pair]]:
         pairs = [*task["train"], *task["test"]]
-        if not self.augment:
+        if not self.augment or augmentation_index == 0:
             return task["train"], task["test"]
+        if self.split_name != "train" or augmentation_index > self.num_aug:
+            raise ValueError("invalid ARC augmentation index")
         epoch = self.epoch if self.split_name == "train" else 0
         digest = hashlib.sha256(
-            f"{self.augmentation_seed}:{self.split_name}:{epoch}:{task_id}".encode("utf-8")
+            f"{self.augmentation_seed}:{self.split_name}:{epoch}:{task_id}:{augmentation_index}".encode("utf-8")
         ).digest()
         augmented = apply_augmentation(pairs, rng=random.Random(int.from_bytes(digest[:8], "big")))
         train_count = len(task["train"])
         return augmented[:train_count], augmented[train_count:]
 
     @staticmethod
-    def _make_sample(task_id: str, demonstrations: Sequence[Pair], query: Pair, query_index: int) -> dict[str, Any]:
+    def _make_sample(
+        task_id: str,
+        demonstrations: Sequence[Pair],
+        query: Pair,
+        query_index: int,
+        augmentation_index: int = 0,
+    ) -> dict[str, Any]:
         prefix = [BOS_TOKEN]
         for demo_index, demonstration in enumerate(demonstrations):
             prefix.extend(_pair_prefix_tokens(demonstration, add_separator=True))
@@ -202,15 +227,18 @@ class ARCDataset(Dataset):
             "target_grid": [row[:] for row in query["output"]],
             "task_id": task_id,
             "query_index": query_index,
+            "augmentation_index": augmentation_index,
         }
 
     def _validate_lengths(self) -> None:
         if self.max_length is None:
             return
         overlong = []
-        for task_id, task, query_index in self.samples:
-            demonstrations, queries = self._task_pairs(task_id, task)
-            sample = self._make_sample(task_id, demonstrations, queries[query_index], query_index)
+        for task_id, task, query_index, augmentation_index in self.samples:
+            demonstrations, queries = self._task_pairs(task_id, task, augmentation_index)
+            sample = self._make_sample(
+                task_id, demonstrations, queries[query_index], query_index, augmentation_index
+            )
             if sample["input_ids"].numel() > self.max_length:
                 overlong.append(f"{task_id}[{query_index}]={sample['input_ids'].numel()}")
         if overlong:
@@ -237,9 +265,9 @@ class ARCDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        task_id, task, query_index = self.samples[index]
-        demonstrations, queries = self._task_pairs(task_id, task)
-        return self._make_sample(task_id, demonstrations, queries[query_index], query_index)
+        task_id, task, query_index, augmentation_index = self.samples[index]
+        demonstrations, queries = self._task_pairs(task_id, task, augmentation_index)
+        return self._make_sample(task_id, demonstrations, queries[query_index], query_index, augmentation_index)
 
 
 def collate_fn(batch: Sequence[dict[str, Any]], max_length: int | None = None) -> dict[str, Any]:

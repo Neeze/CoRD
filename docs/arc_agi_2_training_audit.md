@@ -7,7 +7,7 @@
 - Only `datasets/ARC-AGI-2/training/*.json` is split at the task-file level. The deterministic default split is 80:20 (800 train and 200 validation tasks for the local corpus).
 - `datasets/ARC-AGI-2/evaluation/*.json` is reserved for final test evaluation. It is not used to select checkpoints.
 - A sample is one query per task. Demonstrations plus the query input are the concept-encoder prefix; only query output tokens and EOS have labels.
-- Train and validation use task-consistent color-permutation and dihedral augmentation. Training augmentation changes deterministically with epoch; validation augmentation is fixed and repeatable. Test augmentation is disabled.
+- Train keeps each canonical task/query and adds `--num-aug` task-consistent color-permutation plus dihedral variants per epoch. Their descriptors change deterministically with epoch; validation and test are canonical/unaugmented.
 - The loader validates ARC grids and refuses silent truncation. Use `--max-length` only as a deliberate safety gate.
 - The checked-in configuration `configs/cord-50m.json` is registered through `cord` and must contain strictly fewer than 50,000,000 unique parameters. Tied embeddings are counted once.
 
@@ -23,6 +23,8 @@ tensorboard --logdir runs --host 127.0.0.1
 ```
 
 Use `--smoke-optimizer-steps N` only for a deliberately limited smoke run. Each run writes split metadata, parameter count, length limits, checkpoint, and final test metrics to its output directory.
+
+`--num-aug N` means N additional train copies per query (plus one canonical copy), so it multiplies samples and optimizer work by `N + 1`. Start with `--num-aug 1`; use 4 only after confirming throughput and memory on the target GPU. The D4/color transforms are task-consistent. Unlike HRM's fixed 30×30 canvas, CoRD does not apply translational padding because its ragged-grid serialization has no safe inverse translation.
 
 TensorBoard includes teacher-forced token-weighted loss/perplexity/accuracy, autoregressive generated-grid validity/exactness, model diagnostics, router usage, optimizer state, and system throughput. Validation and final test generation use one right-padded prompt-only batch, deterministic greedy decoding, the ARC EOS token, and the largest target-completion cap in that batch. Teacher-forced completion exact match is diagnostic; generated grid/task exactness is the ARC quality metric used for checkpoint selection.
 

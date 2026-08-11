@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--num-aug",
+        type=int,
+        default=1,
+        help="Additional task-consistent augmented copies per train query per epoch (plus canonical copy).",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -86,8 +92,15 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
     writer = SummaryWriter(log_dir=str(log_dir))
     try:
-        train_dataset = ARCDataset(split.train_files, max_length=args.max_length, augment=True, augmentation_seed=args.seed, split_name="train")
-        validation_dataset = ARCDataset(split.validation_files, max_length=args.max_length, augment=True, augmentation_seed=args.seed, split_name="validation")
+        train_dataset = ARCDataset(
+            split.train_files,
+            max_length=args.max_length,
+            augment=True,
+            num_aug=args.num_aug,
+            augmentation_seed=args.seed,
+            split_name="train",
+        )
+        validation_dataset = ARCDataset(split.validation_files, max_length=args.max_length, augment=False, augmentation_seed=args.seed, split_name="validation")
         test_dataset = ARCDataset(test_files, max_length=args.max_length, augment=False, augmentation_seed=args.seed, split_name="test")
         loader = partial(collate_fn, max_length=args.max_length)
         generator = torch.Generator().manual_seed(args.seed)
@@ -114,6 +127,7 @@ def main() -> None:
             "parameter_count": parameter_count,
             "split_manifest_digest": split.manifest_digest,
             "train_tasks": len(split.train_files), "validation_tasks": len(split.validation_files), "test_tasks": len(test_files),
+            "num_aug": args.num_aug,
             "train_lengths": train_dataset.lengths(), "validation_lengths": validation_dataset.lengths(), "test_lengths": test_dataset.lengths(),
             "evaluation_protocol": {
                 "teacher_forced": True,

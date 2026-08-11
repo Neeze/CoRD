@@ -54,16 +54,29 @@ def test_prefix_causal_queries_and_collation(tmp_path):
     assert batch["labels"][:, :prefix].eq(IGNORE_INDEX).all()
 
 
-def test_validation_augmentation_is_stable_and_train_changes_by_epoch(tmp_path):
+def test_train_num_aug_keeps_canonical_and_adds_deterministic_task_variants(tmp_path):
     path = tmp_path / "deadbeef.json"
     write_task(path)
-    validation = ARCDataset([path], augment=True, augmentation_seed=3, split_name="validation")
-    assert torch.equal(validation[0]["input_ids"], validation[0]["input_ids"])
-    train = ARCDataset([path], augment=True, augmentation_seed=3, split_name="train")
-    first = train[0]["input_ids"]
+    train = ARCDataset([path], augment=True, num_aug=2, augmentation_seed=3, split_name="train")
+    assert len(train) == 3
+    canonical, first_variant, second_variant = (train[index] for index in range(3))
+    assert [sample["augmentation_index"] for sample in (canonical, first_variant, second_variant)] == [0, 1, 2]
+    assert canonical["task_id"] == first_variant["task_id"] == second_variant["task_id"]
+    assert canonical["query_index"] == first_variant["query_index"] == second_variant["query_index"]
+    assert not torch.equal(canonical["input_ids"], first_variant["input_ids"])
+    first = first_variant["input_ids"]
     train.set_epoch(1)
-    second = train[0]["input_ids"]
+    second = train[1]["input_ids"]
     assert not torch.equal(first, second)
+
+
+def test_num_aug_is_train_only_and_must_be_nonnegative(tmp_path):
+    path = tmp_path / "deadbeef.json"
+    write_task(path)
+    with pytest.raises(ValueError, match="non-negative"):
+        ARCDataset([path], num_aug=-1)
+    with pytest.raises(ValueError, match="train split"):
+        ARCDataset([path], num_aug=1, split_name="validation")
 
 
 def test_invalid_grid_and_length_are_rejected(tmp_path):
