@@ -6,7 +6,7 @@ import hashlib
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -29,16 +29,44 @@ class CordSearchConfig:
     novelty_weight: float = 0.1
     deterministic: bool = True
     seed: int = 0
+    max_verified_leaves: int = 4
 
     def __post_init__(self) -> None:
         if self.max_expansions < 0:
             raise ValueError("max_expansions must be non-negative")
         if self.beam_size < 1:
             raise ValueError("beam_size must be positive")
+        if self.max_verified_leaves < 1:
+            raise ValueError("max_verified_leaves must be positive")
         if self.exploration_weight < 0.0 or self.compute_cost_weight < 0.0:
             raise ValueError("exploration and compute-cost weights must be non-negative")
         if self.memory_cost_weight < 0.0 or self.novelty_weight < 0.0:
             raise ValueError("memory and novelty weights must be non-negative")
+
+
+@dataclass(frozen=True)
+class CordDecodeContext:
+    """Prompt and decode budget supplied to a detached leaf decoder."""
+
+    input_ids: torch.LongTensor
+    prefix_lengths: torch.LongTensor
+    max_new_tokens: int
+    task_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CordVerifierResult:
+    """Typed terminal evaluation; exact reward is kept separate from shaping."""
+
+    valid: bool
+    exact_reward: float
+    shaping_reward: float = 0.0
+    reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def reward(self) -> float:
+        return self.exact_reward + self.shaping_reward
 
 
 @dataclass
@@ -55,6 +83,10 @@ class CordStateRecord:
     rng_seed: int
     verified: bool = False
     provenance_ids: tuple[int, ...] = ()
+    decoded_tokens: tuple[int, ...] = ()
+    verifier_valid: Optional[bool] = None
+    verifier_reason: str = ""
+    resource_cost: float = 0.0
     state: Optional[torch.Tensor] = field(default=None, repr=False)
     checkpoint: Optional[torch.Tensor] = field(default=None, repr=False)
 

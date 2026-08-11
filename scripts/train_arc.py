@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from cord import CordConfig, CordForCausalLM, build_cord_optimizer_param_groups
 from dataset.data import ARC_VOCAB_SIZE, ARCDataset, collate_fn, discover_arc_tasks, split_arc_training_files
-from trainer.trainer import evaluate, train_epoch
+from trainer.trainer import evaluate, is_better_validation, train_epoch, validate_metrics
 
 
 def unique_parameter_count(model: torch.nn.Module) -> int:
@@ -115,13 +115,27 @@ def main() -> None:
             "split_manifest_digest": split.manifest_digest,
             "train_tasks": len(split.train_files), "validation_tasks": len(split.validation_files), "test_tasks": len(test_files),
             "train_lengths": train_dataset.lengths(), "validation_lengths": validation_dataset.lengths(), "test_lengths": test_dataset.lengths(),
+            "evaluation_protocol": {
+                "teacher_forced": True,
+                "autoregressive_generation": True,
+                "generation": {
+                    "decode": "greedy",
+                    "do_sample": False,
+                    "num_beams": 1,
+                    "use_cache": True,
+                    "eos_token_id": 2,
+                    "pad_token_id": 0,
+                    "max_new_tokens": "largest non-padding target completion in each batch",
+                },
+                "checkpoint_selection": ["task_exact", "grid_exact", "-loss"],
+            },
         }
-        (output_dir / "run.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        (output_dir / "run.json").write_text(json.dumps(metadata, indent=2, allow_nan=False), encoding="utf-8")
         writer.add_text("run/config", json.dumps(metadata, indent=2), 0)
         writer.add_scalar("system/parameter_count", parameter_count, 0)
         print(json.dumps(metadata, indent=2))
         global_step = 0
-        best_loss = float("inf")
+        best_metrics = None
         best_dir = output_dir / "best"
         if not args.eval_only:
             for epoch in range(args.epochs):
@@ -133,19 +147,35 @@ def main() -> None:
                 )
                 validation_metrics = evaluate(model, validation_loader, device, writer, global_step, namespace="val")
                 print(f"epoch={epoch} train={train_metrics} val={validation_metrics}")
-                if validation_metrics["loss"] < best_loss:
-                    best_loss = validation_metrics["loss"]
+                validate_metrics(validation_metrics)
+                if is_better_validation(validation_metrics, best_metrics):
+                    best_metrics = validation_metrics
                     model.save_pretrained(best_dir)
-                    torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "epoch": epoch, "global_step": global_step}, best_dir / "trainer_state.pt")
+                    torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "epoch": epoch, "global_step": global_step, "validation_metrics": validation_metrics}, best_dir / "trainer_state.pt")
+                    (output_dir / "best_validation_metrics.json").write_text(
+                        json.dumps(validation_metrics, indent=2, allow_nan=False), encoding="utf-8"
+                    )
                 if args.smoke_optimizer_steps is not None and global_step >= args.smoke_optimizer_steps:
                     break
         checkpoint_dir = args.resume_from if args.eval_only and args.resume_from else best_dir
         if checkpoint_dir is None or not checkpoint_dir.exists():
-            raise FileNotFoundError("no best validation checkpoint exists; supply --resume-from for --eval-only")
+            raise FileNotFoundError("no finite validation checkpoint exists; supply --resume-from for --eval-only")
         model = CordForCausalLM.from_pretrained(checkpoint_dir).to(device)
         test_metrics = evaluate(model, test_loader, device, writer, global_step, namespace="test")
+        validate_metrics(test_metrics)
         print(f"final_test={test_metrics}")
-        (output_dir / "final_test_metrics.json").write_text(json.dumps(test_metrics, indent=2), encoding="utf-8")
+        final_artifacts = {
+            "checkpoint": str(checkpoint_dir),
+            "selection": metadata["evaluation_protocol"]["checkpoint_selection"],
+            "teacher_forced_and_generated": test_metrics,
+        }
+        (output_dir / "final_test_metrics.json").write_text(json.dumps(final_artifacts, indent=2, allow_nan=False), encoding="utf-8")
+        (output_dir / "run.json").write_text(json.dumps(metadata, indent=2, allow_nan=False), encoding="utf-8")
+        if best_metrics is not None:
+            validate_metrics(best_metrics)
+            metadata["best_validation_metrics"] = best_metrics
+            (output_dir / "run.json").write_text(json.dumps(metadata, indent=2, allow_nan=False), encoding="utf-8")
+
         writer.flush()
     finally:
         writer.close()

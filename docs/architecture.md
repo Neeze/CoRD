@@ -8,7 +8,9 @@ two public execution paths:
    autoregressively from that workspace.
 2. `search()` implements reward-guided state-graph expansion over detached
    concept packets. It owns the hot frontier, cold archive, rollback, branch,
-   merge and halt operations.
+   merge and halt operations. Rollback selectively gates an archived ancestor;
+   merge uses gated cross-attention from one concept packet into another rather
+   than averaging their states.
 
 The concept codec uses learned slot queries with multi-head attention in the
 configured latent width. It attends only to the prompt prefix, preventing
@@ -23,6 +25,10 @@ The shared recurrent core follows the research blueprint: three KDA layers and
 one gated MLA layer, repeated with shared weights. Latent MoE, SiTU/SwiGLU
 selection and bounded Block AttnRes are added behind configuration flags so the
 50M prototype can be profiled before scaling.
+
+The optional FLA KDA backend is deliberately not treated as validated unless it
+is installed and its parity test runs on compatible hardware. The eager KDA
+reference is the portable correctness path.
 
 ## Reference implementations
 

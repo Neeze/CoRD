@@ -111,6 +111,25 @@ def test_tuple_output_and_auto_classes(tiny_config):
     assert isinstance(transformers.AutoModelForCausalLM.from_config(tiny_config), CordForCausalLM)
 
 
+def test_generate_accepts_transformers_empty_cache(tiny_config):
+    model = CordForCausalLM(tiny_config).eval()
+    prompt = torch.randint(0, tiny_config.vocab_size, (2, 4))
+    prompt[0, -1] = tiny_config.pad_token_id
+    generated = model.generate(
+        input_ids=prompt,
+        attention_mask=torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]]),
+        prefix_lengths=torch.tensor([3, 4]),
+        max_new_tokens=2,
+        do_sample=False,
+        num_beams=1,
+        use_cache=True,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+    assert generated.shape[0] == 2
+    assert generated.shape[1] >= prompt.shape[1]
+
+
 def test_cached_decode_matches_full_decode(tiny_config):
     model = CordForCausalLM(tiny_config).eval()
     prompt = torch.randint(0, tiny_config.vocab_size, (1, 3))
@@ -141,6 +160,20 @@ def test_state_graph_search(tiny_config):
     )
     assert result.best_state.ndim == 2
     assert result.num_expansions is not None
+
+
+def test_causal_lm_search_decodes_leaf_with_its_cache(tiny_config):
+    model = CordForCausalLM(tiny_config).eval()
+    prompt = torch.randint(0, tiny_config.vocab_size, (1, 4))
+    result = model.search(
+        prompt,
+        prefix_lengths=torch.tensor([4]),
+        search_config=CordSearchConfig(max_expansions=1, beam_size=1),
+        max_new_tokens=2,
+    )
+    assert result.decoded_tokens is not None
+    assert len(result.decoded_tokens) == 1
+    assert 1 <= len(result.decoded_tokens[0]) <= 2
 
 
 def test_invalid_config_is_rejected():

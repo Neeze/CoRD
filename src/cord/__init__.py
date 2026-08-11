@@ -5,7 +5,7 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 from .configuration_cord import CordConfig
 from .modeling_cord import CordForCausalLM, CordModel, CordPreTrainedModel
 from .outputs import CordCausalLMOutputWithPast, CordConceptPacket, CordModelOutput, CordSearchOutput
-from .state_graph import CordOperator, CordSearchConfig
+from .state_graph import CordDecodeContext, CordOperator, CordSearchConfig, CordVerifierResult
 from .training import (
     CordLossTargets,
     build_cord_optimizer_param_groups,
@@ -47,6 +47,8 @@ __all__ = [
     "CordSearchOutput",
     "CordOperator",
     "CordSearchConfig",
+    "CordDecodeContext",
+    "CordVerifierResult",
     "CordLossTargets",
     "compute_cord_loss",
     "build_cord_optimizer_param_groups",

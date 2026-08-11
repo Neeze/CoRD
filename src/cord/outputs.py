@@ -69,6 +69,11 @@ class CordSearchOutput(ModelOutput):
     uncertainties: Optional[torch.FloatTensor] = None
     novelties: Optional[torch.FloatTensor] = None
     verified: Optional[tuple[bool, ...]] = None
+    decoded_tokens: Optional[tuple[tuple[int, ...], ...]] = None
+    verifier_valid: Optional[tuple[Optional[bool], ...]] = None
+    verifier_reasons: Optional[tuple[str, ...]] = None
+    resource_costs: Optional[torch.FloatTensor] = None
+    trajectory: Optional[tuple[dict, ...]] = None
     num_expansions: Optional[int] = None
 
 

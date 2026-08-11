@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from tqdm.auto import tqdm
 
 from cord.training import update_router_biases
-from dataset.data import EOS_TOKEN, GRID_OFFSET, IGNORE_INDEX, ROW_SEP
+from dataset.data import EOS_TOKEN, GRID_OFFSET, IGNORE_INDEX, PAD_TOKEN, ROW_SEP
 
 
 def decode_arc_grid(tokens: Iterable[int], *, require_eos: bool = True) -> list[list[int]] | None:
@@ -52,8 +52,12 @@ class ARCMetrics:
         self.token_count = 0
         self.correct_tokens = 0
         self.completion_exact = 0
-        self.examples = 0
+        self.teacher_forced_examples = 0
+        self.generated_examples = 0
         self.valid_grids = 0
+        self.generated_tasks: set[str] = set()
+        self.generated_query_counts: dict[str, int] = defaultdict(int)
+        self.expected_query_counts: dict[str, int] = {}
         self.grid_exact = 0
         self.shape_exact = 0
         self.cell_correct = 0
@@ -68,6 +72,8 @@ class ARCMetrics:
         valid = target_ids.ne(IGNORE_INDEX)
         if not valid.any():
             return
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError("non-finite logits in teacher-forced metrics")
         log_probs = F.log_softmax(logits, dim=-1)
         self.loss_sum += float(-log_probs[valid, target_ids[valid]].sum().detach().cpu())
         predictions = logits.argmax(dim=-1)
@@ -76,11 +82,14 @@ class ARCMetrics:
         for row in range(target_ids.shape[0]):
             row_valid = valid[row]
             if row_valid.any():
-                self.examples += 1
+                self.teacher_forced_examples += 1
                 self.completion_exact += int(torch.equal(predictions[row, row_valid], target_ids[row, row_valid]))
 
     def update_generated(self, task_id: str, predicted_tokens: Iterable[int], target_grid: list[list[int]]) -> None:
         """Score one autoregressive completion against its query grid."""
+        self.generated_examples += 1
+        self.generated_tasks.add(task_id)
+        self.generated_query_counts[task_id] += 1
         predicted_grid = decode_arc_grid(predicted_tokens)
         if predicted_grid is None:
             self.malformed += 1
@@ -103,16 +112,20 @@ class ARCMetrics:
             )
 
     def as_dict(self) -> dict[str, float]:
+        teacher_forced_loss = self.loss_sum / self.token_count if self.token_count else float("inf")
+        generated_count = self.generated_examples
         metrics = {
-            "loss": self.loss_sum / self.token_count if self.token_count else float("inf"),
-            "perplexity": math.exp(min(20.0, self.loss_sum / self.token_count)) if self.token_count else float("inf"),
+            "loss": teacher_forced_loss,
+            "perplexity": math.exp(min(20.0, teacher_forced_loss)) if self.token_count else float("inf"),
             "token_accuracy": self.correct_tokens / self.token_count if self.token_count else 0.0,
-            "completion_exact": self.completion_exact / self.examples if self.examples else 0.0,
-            "examples": float(self.examples),
+            "completion_exact": self.completion_exact / self.teacher_forced_examples if self.teacher_forced_examples else 0.0,
+            "teacher_forced_examples": float(self.teacher_forced_examples),
+            "generated_examples": float(generated_count),
+            "examples": float(self.teacher_forced_examples),
             "supervised_tokens": float(self.token_count),
-            "valid_grid_rate": self.valid_grids / self.examples if self.examples else 0.0,
-            "grid_exact": self.grid_exact / self.examples if self.examples else 0.0,
-            "shape_accuracy": self.shape_exact / self.examples if self.examples else 0.0,
+            "valid_grid_rate": self.valid_grids / generated_count if generated_count else 0.0,
+            "grid_exact": self.grid_exact / generated_count if generated_count else 0.0,
+            "shape_accuracy": self.shape_exact / generated_count if generated_count else 0.0,
             "cell_accuracy": self.cell_correct / self.cell_total if self.cell_total else 0.0,
             "malformed_outputs": float(self.malformed),
             "task_exact": (
@@ -122,6 +135,24 @@ class ARCMetrics:
         }
         return metrics
 
+    def validate(self, *, require_teacher_forced: bool = True, require_generated: bool = True) -> None:
+        if require_teacher_forced and (not self.token_count or not self.teacher_forced_examples):
+            raise ValueError("evaluation produced no teacher-forced supervised examples")
+        if require_generated and not self.generated_examples:
+            raise ValueError("evaluation produced no generated examples")
+        metrics = self.as_dict()
+        invalid = [name for name, value in metrics.items() if not math.isfinite(value)]
+        if invalid:
+            raise FloatingPointError(f"non-finite metrics: {', '.join(invalid)}")
+        incomplete_tasks = [task_id for task_id, count in self.generated_query_counts.items()
+                            if self.expected_query_counts.get(task_id, count) != count]
+        if incomplete_tasks:
+            raise ValueError(f"generated evaluation incomplete for tasks: {', '.join(incomplete_tasks[:5])}")
+
+    def set_expected_query_counts(self, task_ids: Iterable[str]) -> None:
+        for task_id in task_ids:
+            self.expected_query_counts[task_id] = self.expected_query_counts.get(task_id, 0) + 1
+
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
     return {
@@ -130,12 +161,101 @@ def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, torch.T
     }
 
 
+def _generation_inputs(tensors: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], int]:
+    """Build a right-padded, prompt-only batch and its shared decode cap.
+
+    ``input_ids`` in an ARC training batch contains the target continuation, so
+    it must never be forwarded directly to ``generate``.  Keeping the prompt
+    batch shape separate also makes the returned-sequence slice unambiguous.
+    """
+    prefix_lengths = tensors["prefix_lengths"].to(dtype=torch.long)
+    if prefix_lengths.ndim != 1 or prefix_lengths.numel() != tensors["input_ids"].shape[0]:
+        raise ValueError("ARC generation requires one prefix length per batch row")
+    if (prefix_lengths < 1).any():
+        raise ValueError("ARC generation requires non-empty prefixes")
+    prompt_width = int(prefix_lengths.max().item())
+    if prompt_width > tensors["input_ids"].shape[1]:
+        raise ValueError("ARC prefix length exceeds collated input width")
+    target_lengths = tensors["target_ids"].ne(IGNORE_INDEX).sum(dim=-1)
+    if not target_lengths.numel() or (target_lengths < 1).any():
+        raise ValueError("ARC generation requires at least one target token per row")
+    input_ids = tensors["input_ids"].new_full(
+        (prefix_lengths.numel(), prompt_width), PAD_TOKEN
+    )
+    attention_mask = tensors["attention_mask"].new_zeros(input_ids.shape)
+    for row, prefix_length in enumerate(prefix_lengths.tolist()):
+        input_ids[row, :prefix_length] = tensors["input_ids"][row, :prefix_length]
+        attention_mask[row, :prefix_length] = 1
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "prefix_lengths": prefix_lengths,
+    }, int(target_lengths.max().item())
+
+
+def _generated_completions(
+    model: torch.nn.Module,
+    generation_inputs: dict[str, torch.Tensor],
+    max_new_tokens: int,
+) -> list[list[int]]:
+    generated = model.generate(
+        **generation_inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+        use_cache=True,
+        eos_token_id=EOS_TOKEN,
+        pad_token_id=PAD_TOKEN,
+    )
+    prompt_width = generation_inputs["input_ids"].shape[1]
+    if (
+        generated.ndim != 2
+        or generated.shape[0] != generation_inputs["input_ids"].shape[0]
+        or generated.shape[1] < prompt_width
+    ):
+        raise ValueError("generation returned an invalid sequence shape")
+    return [row[prompt_width:].tolist() for row in generated]
+
+
+def _assert_finite_outputs(
+    outputs: Any,
+    *,
+    namespace: str,
+    batch_index: int,
+    task_ids: Iterable[str],
+    supervised_tokens: int,
+) -> None:
+    context = (
+        f"namespace={namespace}, batch={batch_index}, "
+        f"task_ids={','.join(task_ids)}, supervised_tokens={supervised_tokens}"
+    )
+    if outputs.loss is None:
+        raise ValueError(f"evaluation model output is missing loss at {context}")
+    if not torch.isfinite(outputs.loss):
+        raise FloatingPointError(f"non-finite evaluation loss at {context}")
+    if not torch.isfinite(outputs.logits).all():
+        maximum = outputs.logits.detach().abs().nan_to_num(posinf=float("inf")).max().item()
+        raise FloatingPointError(
+            f"non-finite evaluation logits at {context}, max_abs_logit={maximum}"
+        )
+
+
 def _write_metrics(writer: Any, namespace: str, metrics: dict[str, float], step: int) -> None:
+    invalid = [name for name, value in metrics.items() if not math.isfinite(value)]
+    if invalid:
+        raise FloatingPointError(f"non-finite {namespace} metrics: {', '.join(invalid)}")
     if writer is None:
         return
     for name, value in metrics.items():
-        if math.isfinite(value):
-            writer.add_scalar(f"{namespace}/{name}", value, step)
+        writer.add_scalar(f"{namespace}/{name}", value, step)
+
+
+def _gradient_accumulation_size(dataloader: Iterable[dict[str, Any]], batch_index: int, steps: int) -> int:
+    if not hasattr(dataloader, "__len__"):
+        return steps
+    total_batches = len(dataloader)
+    group_start = batch_index - batch_index % steps
+    return min(steps, total_batches - group_start)
 
 
 def _diagnostics(writer: Any, outputs: Any, step: int) -> None:
@@ -203,7 +323,8 @@ def train_epoch(
         outputs = model(**{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")}, use_cache=False)
         if outputs.loss is None or not torch.isfinite(outputs.loss):
             raise FloatingPointError(f"non-finite training loss at epoch={epoch}, batch={batch_index}")
-        (outputs.loss / gradient_accumulation_steps).backward()
+        accumulation_size = _gradient_accumulation_size(dataloader, batch_index, gradient_accumulation_steps)
+        (outputs.loss / accumulation_size).backward()
         metrics.update_teacher_forced(outputs.logits.detach(), tensors["target_ids"])
         router_counts = _add_counts(router_counts, outputs.router_counts)
         microbatches += 1
@@ -250,8 +371,9 @@ def evaluate(
     global_step: int = 0,
     namespace: str = "val",
     max_steps: int | None = None,
+    generate: bool = True,
 ) -> dict[str, float]:
-    """Run teacher-forced prefix-causal evaluation and return weighted metrics."""
+    """Run teacher-forced and, by default, autoregressive ARC evaluation."""
     model.eval()
     metrics = ARCMetrics()
     progress_total = len(dataloader) if hasattr(dataloader, "__len__") else None
@@ -267,17 +389,61 @@ def evaluate(
     for batch_index, batch in enumerate(progress):
         tensors = _to_device(batch, device)
         outputs = model(**{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")}, use_cache=False)
-        if outputs.loss is None:
-            raise ValueError("evaluation model output is missing loss")
+        _assert_finite_outputs(
+            outputs,
+            namespace=namespace,
+            batch_index=batch_index,
+            task_ids=batch["task_ids"],
+            supervised_tokens=int(tensors["target_ids"].ne(IGNORE_INDEX).sum().item()),
+        )
         metrics.update_teacher_forced(outputs.logits, tensors["target_ids"])
+        if generate:
+            metrics.set_expected_query_counts(batch["task_ids"])
+            generation_inputs, max_new_tokens = _generation_inputs(tensors)
+            completions = _generated_completions(model, generation_inputs, max_new_tokens)
+            for task_id, completion, target_grid in zip(
+                batch["task_ids"], completions, batch["target_grids"], strict=True
+            ):
+                metrics.update_generated(task_id, completion, target_grid)
         _diagnostics(writer, outputs, global_step)
         running_loss = metrics.loss_sum / metrics.token_count if metrics.token_count else float("inf")
-        progress.set_postfix(loss=f"{running_loss:.4f}", examples=metrics.examples)
+        progress.set_postfix(
+            loss=f"{running_loss:.4f}",
+            generated_exact=f"{metrics.grid_exact / metrics.generated_examples:.3f}" if metrics.generated_examples else "n/a",
+        )
         if max_steps is not None and batch_index + 1 >= max_steps:
             break
+    metrics.validate(require_teacher_forced=True, require_generated=generate)
     aggregate = metrics.as_dict()
     _write_metrics(writer, namespace, aggregate, global_step)
     return aggregate
+
+
+def is_better_validation(current: dict[str, float], best: dict[str, float] | None) -> bool:
+    """Compare validation metrics by ARC task quality, then teacher-forced loss."""
+    if best is None:
+        return True
+    return (current["task_exact"], current["grid_exact"], -current["loss"]) > (
+        best["task_exact"], best["grid_exact"], -best["loss"]
+    )
+
+
+def validate_metrics(metrics: dict[str, float]) -> None:
+    required = {
+        "loss", "perplexity", "token_accuracy", "completion_exact",
+        "teacher_forced_examples", "generated_examples", "supervised_tokens",
+        "valid_grid_rate", "grid_exact", "shape_accuracy", "cell_accuracy",
+        "malformed_outputs", "task_exact",
+    }
+    missing = sorted(required - metrics.keys())
+    if missing:
+        raise ValueError(f"incomplete evaluation metrics: {', '.join(missing)}")
+    invalid = [name for name, value in metrics.items() if not math.isfinite(value)]
+    if invalid:
+        raise FloatingPointError(f"non-finite metrics: {', '.join(invalid)}")
+    for name in ("teacher_forced_examples", "generated_examples", "supervised_tokens"):
+        if metrics[name] <= 0:
+            raise ValueError(f"evaluation metric {name} must be positive")
 
 
 # Compatibility alias for older scripts.
@@ -286,4 +452,4 @@ def validate(*args: Any, **kwargs: Any) -> float:
     return metrics["loss"]
 
 
-__all__ = ["ARCMetrics", "decode_arc_grid", "evaluate", "train_epoch", "validate"]
+__all__ = ["ARCMetrics", "decode_arc_grid", "evaluate", "is_better_validation", "train_epoch", "validate", "validate_metrics"]

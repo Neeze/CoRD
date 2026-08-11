@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from typing import Callable, Optional
 
@@ -27,9 +28,11 @@ from .modules import (
 from .outputs import CordCausalLMOutputWithPast, CordConceptPacket, CordModelOutput, CordSearchOutput
 from .state_graph import (
     CordOperator,
+    CordDecodeContext,
     CordSearchConfig,
     CordStateArchive,
     CordStateRecord,
+    CordVerifierResult,
     state_fingerprint,
 )
 from .training import CordLossTargets, compute_cord_loss
@@ -282,6 +285,7 @@ class CordModel(CordPreTrainedModel):
         self.operator_embeddings = nn.Parameter(torch.empty(config.num_reasoning_operators, config.hidden_size))
         self.rollback_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.merge_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
+        self.merge_cross_attention = CordCrossAttention(config)
         self.post_init()
         nn.init.normal_(self.concept_encoder.slot_queries, mean=0.0, std=config.initializer_range)
         nn.init.normal_(self.operator_embeddings, mean=0.0, std=config.initializer_range)
@@ -621,8 +625,13 @@ class CordModel(CordPreTrainedModel):
             gate_input = torch.cat((state, other_state), dim=-1)
             state = other_state + torch.sigmoid(self.rollback_gate(gate_input)) * (state - other_state)
         elif operator is CordOperator.MERGE and other_state is not None:
-            gate_input = torch.cat((state, other_state), dim=-1)
-            state = other_state + torch.sigmoid(self.merge_gate(gate_input)) * (state - other_state)
+            query_state = state if state.ndim == 3 else state.unsqueeze(0)
+            source_state = other_state if other_state.ndim == 3 else other_state.unsqueeze(0)
+            cross_update = self.merge_cross_attention(query_state, source_state)
+            if state.ndim == 2:
+                cross_update = cross_update.squeeze(0)
+            gate_input = torch.cat((state, cross_update), dim=-1)
+            state = state + torch.sigmoid(self.merge_gate(gate_input)) * cross_update
         state_3d = state if state.ndim == 3 else state.unsqueeze(0)
         transitioned, _, _, _, _, _ = self.recurrent_core(state_3d + operator_embedding)
         return transitioned if state.ndim == 3 else transitioned.squeeze(0)
@@ -633,7 +642,9 @@ class CordModel(CordPreTrainedModel):
         input_ids: torch.LongTensor,
         prefix_lengths: Optional[torch.LongTensor] = None,
         search_config: Optional[CordSearchConfig] = None,
-        verifier: Optional[Callable[[torch.Tensor], bool | float]] = None,
+        decode_context: Optional[CordDecodeContext] = None,
+        decode_state: Optional[Callable[[torch.Tensor, CordDecodeContext], list[int]]] = None,
+        verifier: Optional[Callable[[list[int], CordDecodeContext], CordVerifierResult]] = None,
     ) -> CordSearchOutput:
         """Run bounded beam/UCB search over detached concept states."""
 
@@ -689,6 +700,10 @@ class CordModel(CordPreTrainedModel):
                         other_id = frontier[0]
                     elif operator is CordOperator.ROLLBACK and parent.parent_ids:
                         other_id = parent.parent_ids[0]
+                        # Prefer an older archived ancestor when available: rollback
+                        # is a graph operation, not merely an undo of the last edge.
+                        while archive.get(other_id).parent_ids:
+                            other_id = archive.get(other_id).parent_ids[0]
                     other_state = (
                         archive.materialize(other_id, replay_state, input_ids.device)
                         if other_id is not None
@@ -737,38 +752,54 @@ class CordModel(CordPreTrainedModel):
             for _, record, _ in candidates[: search_config.beam_size]:
                 archive.add(record)
                 frontier.append(record.state_id)
+        terminal_ids: list[str] = []
         if frontier:
-            terminal_parent = frontier[0]
-            terminal_state = archive.materialize(terminal_parent, replay_state, input_ids.device)
-            terminal_id = hashlib_state_id(
-                terminal_parent, CordOperator.HALT.value, len(archive.records), state_fingerprint(terminal_state)
-            )
-            terminal_record = archive.get(terminal_parent)
-            terminal_reward = terminal_record.reward
-            terminal_verified = terminal_record.verified
-            if verifier is not None:
-                verification = verifier(terminal_state)
-                terminal_verified = bool(verification)
-                if isinstance(verification, (float, int)) and not isinstance(verification, bool):
-                    terminal_reward = float(verification)
-            archive.add(
-                CordStateRecord(
-                    terminal_id,
-                    (terminal_parent,),
-                    CordOperator.HALT,
-                    terminal_record.depth + 1,
-                    terminal_record.value,
-                    terminal_reward,
-                    terminal_record.uncertainty,
-                    terminal_record.novelty,
+            if verifier is not None and (decode_context is None or decode_state is None):
+                raise ValueError("decoded verification requires both decode_context and decode_state")
+            for terminal_index, terminal_parent in enumerate(frontier[: search_config.max_verified_leaves]):
+                terminal_state = archive.materialize(terminal_parent, replay_state, input_ids.device)
+                terminal_id = hashlib_state_id(
+                    terminal_parent,
+                    CordOperator.HALT.value,
+                    len(archive.records),
                     state_fingerprint(terminal_state),
-                    search_config.seed,
-                    terminal_verified,
-                    provenance_ids=terminal_record.provenance_ids,
-                    state=terminal_state,
                 )
-            )
-            frontier.append(terminal_id)
+                terminal_record = archive.get(terminal_parent)
+                decoded_tokens: tuple[int, ...] = ()
+                result = None
+                if decode_state is not None and decode_context is not None:
+                    decoded_tokens = tuple(int(token) for token in decode_state(terminal_state, decode_context))
+                if verifier is not None:
+                    result = verifier(list(decoded_tokens), decode_context)
+                    if not isinstance(result, CordVerifierResult):
+                        raise TypeError("state-graph verifier must return CordVerifierResult")
+                terminal_reward = result.reward if result is not None else terminal_record.reward
+                terminal_verified = bool(result is not None and result.valid and result.exact_reward > 0.0)
+                resource_cost = float(terminal_record.depth + 1 + len(decoded_tokens))
+                archive.add(
+                    CordStateRecord(
+                        terminal_id,
+                        (terminal_parent,),
+                        CordOperator.HALT,
+                        terminal_record.depth + 1,
+                        terminal_record.value,
+                        terminal_reward,
+                        terminal_record.uncertainty,
+                        terminal_record.novelty,
+                        state_fingerprint(terminal_state),
+                        search_config.seed + terminal_index,
+                        terminal_verified,
+                        provenance_ids=terminal_record.provenance_ids,
+                        decoded_tokens=decoded_tokens,
+                        verifier_valid=result.valid if result is not None else None,
+                        verifier_reason=result.reason if result is not None else "",
+                        resource_cost=resource_cost,
+                        state=terminal_state,
+                    )
+                )
+                terminal_ids.append(terminal_id)
+        if terminal_ids:
+            frontier = terminal_ids
         records = [archive.get(state_id) for state_id in frontier]
         best = (
             max(records, key=lambda record: (record.verified, record.reward, record.value))
@@ -776,6 +807,7 @@ class CordModel(CordPreTrainedModel):
             else archive.get(root_id)
         )
         best_state = archive.materialize(best.state_id, replay_state, input_ids.device)
+        prompt_identity = hashlib.sha1(input_ids.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
         return CordSearchOutput(
             best_state=best_state,
             best_state_id=best.state_id,
@@ -787,6 +819,29 @@ class CordModel(CordPreTrainedModel):
             uncertainties=torch.tensor([record.uncertainty for record in records], device=input_ids.device),
             novelties=torch.tensor([record.novelty for record in records], device=input_ids.device),
             verified=tuple(record.verified for record in records),
+            decoded_tokens=tuple(record.decoded_tokens for record in records),
+            verifier_valid=tuple(record.verifier_valid for record in records),
+            verifier_reasons=tuple(record.verifier_reason for record in records),
+            resource_costs=torch.tensor([record.resource_cost for record in records], device=input_ids.device),
+            trajectory=tuple(
+                {
+                    "task_id": decode_context.task_id if decode_context is not None else None,
+                    "prompt_identity": prompt_identity,
+                    "state_id": record.state_id,
+                    "parent_ids": record.parent_ids,
+                    "operator": record.operator.value,
+                    "depth": record.depth,
+                    "value": record.value,
+                    "reward": record.reward,
+                    "uncertainty": record.uncertainty,
+                    "decoded_tokens": record.decoded_tokens,
+                    "verifier_valid": record.verifier_valid,
+                    "verifier_reason": record.verifier_reason,
+                    "rng_seed": record.rng_seed,
+                    "resource_cost": record.resource_cost,
+                }
+                for record in archive.records.values()
+            ),
             num_expansions=len(archive.records) - 1,
         )
 
@@ -822,8 +877,67 @@ class CordForCausalLM(CordPreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
         self.lm_head = new_embeddings
 
-    def search(self, *args, **kwargs) -> CordSearchOutput:
-        return self.model.search(*args, **kwargs)
+    @torch.no_grad()
+    def decode_concept_state(
+        self,
+        concept_state: torch.Tensor,
+        context: CordDecodeContext,
+    ) -> list[int]:
+        """Greedily decode a detached graph leaf through CoRD's normal cache."""
+        if concept_state.ndim != 2:
+            raise ValueError("a graph leaf must have shape (concept_slots, hidden_size)")
+        if context.input_ids.shape[0] != 1:
+            raise ValueError("decoded graph leaves currently require one prompt")
+        state = concept_state.unsqueeze(0)
+        cache = CordCache(
+            len(self.model.decoder_layers),
+            concept_states=state,
+            concept_confidence=torch.ones(state.shape[:2], dtype=state.dtype, device=state.device),
+            prefix_lengths=context.prefix_lengths.to(device=state.device, dtype=torch.long),
+        )
+        current = torch.full(
+            (1, 1), self.config.bos_token_id, dtype=torch.long, device=state.device
+        )
+        decoded: list[int] = []
+        for _ in range(context.max_new_tokens):
+            output = self(
+                input_ids=current,
+                attention_mask=torch.ones_like(current),
+                past_key_values=cache,
+                prefix_lengths=context.prefix_lengths,
+                use_cache=True,
+            )
+            cache = output.past_key_values
+            token = int(output.logits[:, -1].argmax(dim=-1).item())
+            decoded.append(token)
+            if token == self.config.eos_token_id:
+                break
+            current = current.new_tensor([[token]])
+        return decoded
+
+    def search(
+        self,
+        input_ids: torch.LongTensor,
+        prefix_lengths: Optional[torch.LongTensor] = None,
+        search_config: Optional[CordSearchConfig] = None,
+        verifier: Optional[Callable[[list[int], CordDecodeContext], CordVerifierResult]] = None,
+        *,
+        max_new_tokens: int = 32,
+        task_id: Optional[str] = None,
+    ) -> CordSearchOutput:
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        if prefix_lengths is None:
+            prefix_lengths = input_ids.new_tensor([input_ids.shape[1]])
+        context = CordDecodeContext(input_ids, prefix_lengths, max_new_tokens, task_id)
+        return self.model.search(
+            input_ids,
+            prefix_lengths=prefix_lengths,
+            search_config=search_config,
+            decode_context=context,
+            decode_state=self.decode_concept_state,
+            verifier=verifier,
+        )
 
     def forward(
         self,
@@ -912,6 +1026,13 @@ class CordForCausalLM(CordPreTrainedModel, GenerationMixin):
         prefix_lengths: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
+        # Transformers may initialize generation with an empty DynamicCache. CoRD
+        # owns a specialized cache, so treat that placeholder as no cache and let
+        # the first forward pass construct a CordCache.
+        if past_key_values is not None and not isinstance(past_key_values, CordCache):
+            cache_length = past_key_values.get_seq_length() if hasattr(past_key_values, "get_seq_length") else None
+            if cache_length == 0:
+                past_key_values = None
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
         elif prefix_lengths is None:
