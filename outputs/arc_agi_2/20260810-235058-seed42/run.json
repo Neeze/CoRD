@@ -1,0 +1,46 @@
+{
+  "args": {
+    "data_dir": "datasets/ARC-AGI-2",
+    "config": "/home/nampvh/workspace/CoRD/configs/cord-50m.json",
+    "output_dir": "/home/nampvh/workspace/CoRD/outputs/arc_agi_2",
+    "log_dir": "/home/nampvh/workspace/CoRD/runs/arc_agi_2",
+    "seed": 42,
+    "train_fraction": 0.8,
+    "epochs": 10,
+    "batch_size": 2,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.1,
+    "warmup_ratio": 0.05,
+    "max_grad_norm": 1.0,
+    "num_workers": 0,
+    "device": "cuda",
+    "max_length": null,
+    "smoke_optimizer_steps": null,
+    "resume_from": null,
+    "eval_only": false
+  },
+  "parameter_count": 48575003,
+  "split_manifest_digest": "9367e4a53c4c5e1864e15d3580ed260f8aff39bb77954665a483c7d6d14e664f",
+  "train_tasks": 800,
+  "validation_tasks": 200,
+  "test_tasks": 120,
+  "train_lengths": {
+    "samples": 859,
+    "max_prefix": 8380,
+    "max_target": 931,
+    "max_total": 9311
+  },
+  "validation_lengths": {
+    "samples": 217,
+    "max_prefix": 6518,
+    "max_target": 931,
+    "max_total": 7449
+  },
+  "test_lengths": {
+    "samples": 167,
+    "max_prefix": 8380,
+    "max_target": 931,
+    "max_total": 9311
+  }
+}

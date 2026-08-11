@@ -1,0 +1,289 @@
+"""Reusable supervised training and ARC metrics for CoRD experiments."""
+
+from __future__ import annotations
+
+import math
+import time
+from collections import defaultdict
+from collections.abc import Iterable
+from typing import Any
+
+import torch
+from torch.nn import functional as F
+from tqdm.auto import tqdm
+
+from cord.training import update_router_biases
+from dataset.data import EOS_TOKEN, GRID_OFFSET, IGNORE_INDEX, ROW_SEP
+
+
+def decode_arc_grid(tokens: Iterable[int], *, require_eos: bool = True) -> list[list[int]] | None:
+    """Decode a generated ARC completion; return None for malformed token streams."""
+    rows: list[list[int]] = []
+    row: list[int] = []
+    saw_eos = False
+    for token in tokens:
+        token = int(token)
+        if token == EOS_TOKEN:
+            saw_eos = True
+            break
+        if GRID_OFFSET <= token < GRID_OFFSET + 10:
+            row.append(token - GRID_OFFSET)
+        elif token == ROW_SEP:
+            if not row:
+                return None
+            rows.append(row)
+            row = []
+        else:
+            return None
+    if not saw_eos and require_eos:
+        return None
+    if row:
+        return None
+    if not rows or any(len(candidate) != len(rows[0]) for candidate in rows):
+        return None
+    return rows
+
+
+class ARCMetrics:
+    """Token- and task-weighted metric accumulator for ARC completions."""
+
+    def __init__(self) -> None:
+        self.loss_sum = 0.0
+        self.token_count = 0
+        self.correct_tokens = 0
+        self.completion_exact = 0
+        self.examples = 0
+        self.valid_grids = 0
+        self.grid_exact = 0
+        self.shape_exact = 0
+        self.cell_correct = 0
+        self.cell_total = 0
+        self.malformed = 0
+        self.task_queries: dict[str, list[bool]] = defaultdict(list)
+
+    def update_teacher_forced(self, logits: torch.Tensor, target_ids: torch.Tensor) -> None:
+        """Accumulate loss and exact completion metrics from decoder-aligned targets."""
+        if logits.shape[:2] != target_ids.shape:
+            raise ValueError("logits and target_ids must have matching batch and decoder dimensions")
+        valid = target_ids.ne(IGNORE_INDEX)
+        if not valid.any():
+            return
+        log_probs = F.log_softmax(logits, dim=-1)
+        self.loss_sum += float(-log_probs[valid, target_ids[valid]].sum().detach().cpu())
+        predictions = logits.argmax(dim=-1)
+        self.correct_tokens += int(predictions[valid].eq(target_ids[valid]).sum().item())
+        self.token_count += int(valid.sum().item())
+        for row in range(target_ids.shape[0]):
+            row_valid = valid[row]
+            if row_valid.any():
+                self.examples += 1
+                self.completion_exact += int(torch.equal(predictions[row, row_valid], target_ids[row, row_valid]))
+
+    def update_generated(self, task_id: str, predicted_tokens: Iterable[int], target_grid: list[list[int]]) -> None:
+        """Score one autoregressive completion against its query grid."""
+        predicted_grid = decode_arc_grid(predicted_tokens)
+        if predicted_grid is None:
+            self.malformed += 1
+            self.task_queries[task_id].append(False)
+            return
+        self.valid_grids += 1
+        exact = predicted_grid == target_grid
+        self.grid_exact += int(exact)
+        self.task_queries[task_id].append(exact)
+        if len(predicted_grid) == len(target_grid) and all(
+            len(predicted_row) == len(target_row)
+            for predicted_row, target_row in zip(predicted_grid, target_grid)
+        ):
+            self.shape_exact += 1
+            self.cell_total += sum(len(row) for row in target_grid)
+            self.cell_correct += sum(
+                predicted_value == target_value
+                for predicted_row, target_row in zip(predicted_grid, target_grid)
+                for predicted_value, target_value in zip(predicted_row, target_row)
+            )
+
+    def as_dict(self) -> dict[str, float]:
+        metrics = {
+            "loss": self.loss_sum / self.token_count if self.token_count else float("inf"),
+            "perplexity": math.exp(min(20.0, self.loss_sum / self.token_count)) if self.token_count else float("inf"),
+            "token_accuracy": self.correct_tokens / self.token_count if self.token_count else 0.0,
+            "completion_exact": self.completion_exact / self.examples if self.examples else 0.0,
+            "examples": float(self.examples),
+            "supervised_tokens": float(self.token_count),
+            "valid_grid_rate": self.valid_grids / self.examples if self.examples else 0.0,
+            "grid_exact": self.grid_exact / self.examples if self.examples else 0.0,
+            "shape_accuracy": self.shape_exact / self.examples if self.examples else 0.0,
+            "cell_accuracy": self.cell_correct / self.cell_total if self.cell_total else 0.0,
+            "malformed_outputs": float(self.malformed),
+            "task_exact": (
+                sum(all(query_results) for query_results in self.task_queries.values()) / len(self.task_queries)
+                if self.task_queries else 0.0
+            ),
+        }
+        return metrics
+
+
+def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
+    return {
+        key: batch[key].to(device)
+        for key in ("input_ids", "attention_mask", "labels", "prefix_lengths", "target_ids")
+    }
+
+
+def _write_metrics(writer: Any, namespace: str, metrics: dict[str, float], step: int) -> None:
+    if writer is None:
+        return
+    for name, value in metrics.items():
+        if math.isfinite(value):
+            writer.add_scalar(f"{namespace}/{name}", value, step)
+
+
+def _diagnostics(writer: Any, outputs: Any, step: int) -> None:
+    if writer is None:
+        return
+    if outputs.active_loops is not None:
+        writer.add_scalar("diagnostics/active_loops", outputs.active_loops.float().mean().item(), step)
+    if outputs.halting_probs is not None:
+        writer.add_scalar("diagnostics/halting_probability", outputs.halting_probs.float().mean().item(), step)
+    if outputs.loop_values is not None:
+        writer.add_scalar("diagnostics/uncalibrated_value", outputs.loop_values.float().mean().item(), step)
+    if outputs.loop_uncertainties is not None:
+        writer.add_scalar("diagnostics/uncalibrated_uncertainty", outputs.loop_uncertainties.float().mean().item(), step)
+    if outputs.router_counts:
+        counts = sum(outputs.router_counts).float()
+        total = counts.sum().clamp_min(1)
+        for expert, fraction in enumerate(counts / total):
+            writer.add_scalar(f"router/expert_{expert}_fraction", fraction.item(), step)
+
+
+def _add_counts(accumulated: tuple[torch.Tensor, ...] | None, counts: tuple[torch.Tensor, ...] | None):
+    if not counts:
+        return accumulated
+    detached = tuple(count.detach() for count in counts)
+    if accumulated is None:
+        return detached
+    return tuple(left + right for left, right in zip(accumulated, detached))
+
+
+def train_epoch(
+    model: torch.nn.Module,
+    dataloader: Iterable[dict[str, Any]],
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    writer: Any = None,
+    epoch: int = 0,
+    global_step: int = 0,
+    max_steps: int | None = None,
+    gradient_accumulation_steps: int = 1,
+    max_grad_norm: float | None = None,
+    scheduler: Any = None,
+) -> tuple[int, dict[str, float]]:
+    """Train for one epoch, returning effective optimizer steps and aggregate metrics."""
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    model.train()
+    metrics = ARCMetrics()
+    router_counts = None
+    optimizer.zero_grad(set_to_none=True)
+    start = time.monotonic()
+    microbatches = 0
+    progress_total = len(dataloader) if hasattr(dataloader, "__len__") else None
+    if max_steps is not None and progress_total is not None:
+        remaining_steps = max(max_steps - global_step, 0)
+        progress_total = min(progress_total, remaining_steps * gradient_accumulation_steps)
+    progress = tqdm(
+        dataloader,
+        total=progress_total,
+        desc=f"Train epoch {epoch + 1}",
+        unit="batch",
+        dynamic_ncols=True,
+    )
+    for batch_index, batch in enumerate(progress):
+        tensors = _to_device(batch, device)
+        outputs = model(**{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")}, use_cache=False)
+        if outputs.loss is None or not torch.isfinite(outputs.loss):
+            raise FloatingPointError(f"non-finite training loss at epoch={epoch}, batch={batch_index}")
+        (outputs.loss / gradient_accumulation_steps).backward()
+        metrics.update_teacher_forced(outputs.logits.detach(), tensors["target_ids"])
+        router_counts = _add_counts(router_counts, outputs.router_counts)
+        microbatches += 1
+        should_step = microbatches % gradient_accumulation_steps == 0
+        is_last = hasattr(dataloader, "__len__") and batch_index + 1 == len(dataloader)
+        if not should_step and not is_last:
+            continue
+        if max_grad_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            if not torch.isfinite(grad_norm):
+                raise FloatingPointError(f"non-finite gradient norm at global_step={global_step}")
+            if writer is not None:
+                writer.add_scalar("train/gradient_norm", grad_norm.item(), global_step)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        update_router_biases(model, router_counts or ())
+        router_counts = None
+        optimizer.zero_grad(set_to_none=True)
+        if writer is not None:
+            writer.add_scalar("train/loss_step", outputs.loss.item(), global_step)
+            writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        _diagnostics(writer, outputs, global_step)
+        global_step += 1
+        progress.set_postfix(
+            loss=f"{outputs.loss.item():.4f}",
+            step=global_step,
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+        )
+        if max_steps is not None and global_step >= max_steps:
+            break
+    aggregate = metrics.as_dict()
+    aggregate["tokens_per_second"] = metrics.token_count / max(time.monotonic() - start, 1e-9)
+    _write_metrics(writer, "train", aggregate, global_step)
+    return global_step, aggregate
+
+
+@torch.no_grad()
+def evaluate(
+    model: torch.nn.Module,
+    dataloader: Iterable[dict[str, Any]],
+    device: torch.device,
+    writer: Any = None,
+    global_step: int = 0,
+    namespace: str = "val",
+    max_steps: int | None = None,
+) -> dict[str, float]:
+    """Run teacher-forced prefix-causal evaluation and return weighted metrics."""
+    model.eval()
+    metrics = ARCMetrics()
+    progress_total = len(dataloader) if hasattr(dataloader, "__len__") else None
+    if max_steps is not None and progress_total is not None:
+        progress_total = min(progress_total, max_steps)
+    progress = tqdm(
+        dataloader,
+        total=progress_total,
+        desc=f"Evaluate {namespace}",
+        unit="batch",
+        dynamic_ncols=True,
+    )
+    for batch_index, batch in enumerate(progress):
+        tensors = _to_device(batch, device)
+        outputs = model(**{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")}, use_cache=False)
+        if outputs.loss is None:
+            raise ValueError("evaluation model output is missing loss")
+        metrics.update_teacher_forced(outputs.logits, tensors["target_ids"])
+        _diagnostics(writer, outputs, global_step)
+        running_loss = metrics.loss_sum / metrics.token_count if metrics.token_count else float("inf")
+        progress.set_postfix(loss=f"{running_loss:.4f}", examples=metrics.examples)
+        if max_steps is not None and batch_index + 1 >= max_steps:
+            break
+    aggregate = metrics.as_dict()
+    _write_metrics(writer, namespace, aggregate, global_step)
+    return aggregate
+
+
+# Compatibility alias for older scripts.
+def validate(*args: Any, **kwargs: Any) -> float:
+    metrics = evaluate(*args, namespace="val", **kwargs)
+    return metrics["loss"]
+
+
+__all__ = ["ARCMetrics", "decode_arc_grid", "evaluate", "train_epoch", "validate"]
