@@ -7,7 +7,7 @@ BATCH_SIZE="${BATCH_SIZE:-8}"
 DEVICE="${DEVICE:-cuda}"
 
 cd "$ROOT_DIR"
-exec "$PYTHON_BIN" scripts/train_arc.py \
+exec $PYTHON_BIN scripts/train_arc.py \
   --batch-size "$BATCH_SIZE" \
   --device "$DEVICE" \
   "$@"

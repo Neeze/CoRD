@@ -104,9 +104,36 @@ def main() -> None:
         test_dataset = ARCDataset(test_files, max_length=args.max_length, augment=False, augmentation_seed=args.seed, split_name="test")
         loader = partial(collate_fn, max_length=args.max_length)
         generator = torch.Generator().manual_seed(args.seed)
-        train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, generator=generator, num_workers=args.num_workers, collate_fn=loader)
-        validation_loader = DataLoader(validation_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=loader)
-        test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=loader)
+        pin_memory = args.device.startswith("cuda")
+        persistent_workers = args.num_workers > 0
+        train_loader = DataLoader(
+            train_dataset,
+            args.batch_size,
+            shuffle=True,
+            generator=generator,
+            num_workers=args.num_workers,
+            collate_fn=loader,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+        validation_loader = DataLoader(
+            validation_dataset,
+            args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=loader,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=loader,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
         config = CordConfig.from_json_file(args.config)
         if config.vocab_size < ARC_VOCAB_SIZE:
             raise ValueError(f"model vocabulary ({config.vocab_size}) cannot represent ARC tokens ({ARC_VOCAB_SIZE})")

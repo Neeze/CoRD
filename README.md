@@ -1,7 +1,22 @@
 # CoRD Transformers
 
-Standalone Hugging Face Transformers project for the Concept-over-Recurrent-
-Depth (CoRD) language model.
+Standalone Hugging Face Transformers project for the Concept-over-Recurrent-Depth (CoRD) language model.
+
+## Quickstart (All-in-One Setup & Training)
+
+To automatically install `uv` (if needed), sync Python dependencies, tune environment optimizations for high-performance hardware (e.g. RTX 5090 GPU / AMD EPYC CPU), and start model training in a single command, run:
+
+```bash
+./scripts/bash/setup_and_train.sh
+```
+
+### Custom Training Arguments
+
+You can pass extra flags or override environment variables directly:
+
+```bash
+DEVICE=cuda BATCH_SIZE=16 ./scripts/bash/setup_and_train.sh --epochs 50 --num-workers 80
+```
 
 ## Project layout
 
@@ -9,7 +24,11 @@ Depth (CoRD) language model.
 cord/
 ├── configs/                 # Reproducible model configurations
 ├── docs/                    # Architecture and implementation notes
-├── scripts/                 # Developer and profiling utilities
+├── scripts/                 # Developer, bash scripts, and training utilities
+│   ├── bash/
+│   │   ├── setup_and_train.sh   # All-in-one setup & training execution script
+│   │   └── train_model.sh       # Underlying training bash wrapper
+│   └── train_arc.py             # ARC dataset training script
 ├── src/cord/                # Installable Python package
 │   ├── configuration_cord.py
 │   ├── modeling_cord.py
@@ -25,16 +44,18 @@ cord/
 └── pyproject.toml
 ```
 
-The first development target is the approximately 49M parameter prototype
-described in `configs/cord-50m.json`. The 1B configuration from the research
-blueprint is not used by default in tests.
+The first development target is the approximately 49M parameter prototype described in `configs/cord-50m.json`. The 1B configuration from the research blueprint is not used by default in tests.
 
-Install the package into the workspace `astra` environment from this directory
-with:
+## Environment Setup via uv
+
+You can also manually sync the virtual environment with [Astral uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv pip install --python ../astra/bin/python -e '.[test]'
+uv sync
 ```
 
-The optional `kda` extra enables FLA kernels. The eager implementation remains
-the portable reference backend for CPU tests and numerical parity checks.
+The optional `kda` extra enables FLA kernels:
+
+```bash
+uv sync --extra kda
+```
