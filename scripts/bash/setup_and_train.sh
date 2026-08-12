@@ -86,6 +86,7 @@ echo "============================================================"
 chmod +x "$SCRIPT_DIR/train_model.sh"
 
 exec "$SCRIPT_DIR/train_model.sh" \
+  --batch-size "${BATCH_SIZE}" \
   --epochs 50 \
   --num-aug 100 \
   --gradient-accumulation-steps 1 \
