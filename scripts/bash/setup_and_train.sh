@@ -56,7 +56,8 @@ echo "============================================================"
 
 # Environment variables for PyTorch & Hardware Optimization
 export DEVICE="${DEVICE:-cuda}"
-export BATCH_SIZE="${BATCH_SIZE:-16}"
+export BATCH_SIZE="${BATCH_SIZE:-2}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 export PYTHONUNBUFFERED=1
 
 # PyTorch CUDA Memory Allocator optimization to prevent fragmentation
@@ -75,6 +76,7 @@ export PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
 echo "Configuration:"
 echo " - DEVICE: $DEVICE"
 echo " - BATCH_SIZE: $BATCH_SIZE"
+echo " - GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS (Effective Batch Size: $((BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)))"
 echo " - PyTorch Allocator: $PYTORCH_CUDA_ALLOC_CONF"
 echo " - Python Binary: $PYTHON_BIN"
 
@@ -87,9 +89,9 @@ chmod +x "$SCRIPT_DIR/train_model.sh"
 
 exec "$SCRIPT_DIR/train_model.sh" \
   --batch-size "${BATCH_SIZE}" \
+  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
   --epochs 50 \
   --num-aug 100 \
-  --gradient-accumulation-steps 1 \
   --learning-rate 2e-4 \
   --weight-decay 0.1 \
   --warmup-ratio 0.05 \

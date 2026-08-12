@@ -248,7 +248,7 @@ class CordDecoderLayer(nn.Module):
 class CordPreTrainedModel(PreTrainedModel):
     config_class = CordConfig
     base_model_prefix = "model"
-    supports_gradient_checkpointing = False
+    supports_gradient_checkpointing = True
     _no_split_modules = ["CordDecoderLayer", "CordRecurrentMacroBlock"]
     _skip_keys_device_placement = "past_key_values"
 
@@ -473,12 +473,23 @@ class CordModel(CordPreTrainedModel):
             active = torch.ones(input_embeddings.shape[0], device=input_embeddings.device, dtype=torch.bool)
             for loop_index in range(loops):
                 previous = concept_states
-                concept_states, recurrent_states, summaries, _, router_logits, router_counts = self.recurrent_core(
-                    concept_states,
-                    recurrent_states,
-                    summaries,
-                    output_attentions,
-                )
+                if getattr(self, "gradient_checkpointing", False) and self.training:
+                    def _custom_forward(c_states, r_states, summs):
+                        return self.recurrent_core(c_states, r_states, summs, output_attentions)
+                    concept_states, recurrent_states, summaries, _, router_logits, router_counts = torch.utils.checkpoint.checkpoint(
+                        _custom_forward,
+                        concept_states,
+                        recurrent_states,
+                        summaries,
+                        use_reentrant=False,
+                    )
+                else:
+                    concept_states, recurrent_states, summaries, _, router_logits, router_counts = self.recurrent_core(
+                        concept_states,
+                        recurrent_states,
+                        summaries,
+                        output_attentions,
+                    )
                 all_router_logits.extend(router_logits)
                 all_router_counts.extend(router_counts)
                 concept_states = torch.where(active[:, None, None], concept_states, previous)
