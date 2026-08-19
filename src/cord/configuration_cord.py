@@ -52,6 +52,7 @@ class CordConfig(PretrainedConfig):
         archive_checkpoint_interval=4,
         local_bptt_loops=4,
         num_reasoning_operators=5,
+        controller_hidden_size=None,
         hidden_act="silu",
         rms_norm_eps=1e-6,
         initializer_range=0.02,
@@ -123,6 +124,8 @@ class CordConfig(PretrainedConfig):
             raise ValueError("kernel, latent, expert and position sizes must be positive")
         if num_reasoning_operators != 5:
             raise ValueError("CoRD v1 defines exactly five structural operators")
+        if controller_hidden_size is not None and controller_hidden_size < 1:
+            raise ValueError("controller_hidden_size must be positive")
         if not 0.0 <= halting_threshold <= 1.0:
             raise ValueError("halting_threshold must be between 0 and 1")
         if not 0.0 <= loop_dropout <= 1.0 or not 0.0 <= attention_dropout <= 1.0:
@@ -170,6 +173,7 @@ class CordConfig(PretrainedConfig):
         self.archive_checkpoint_interval = archive_checkpoint_interval
         self.local_bptt_loops = local_bptt_loops
         self.num_reasoning_operators = num_reasoning_operators
+        self.controller_hidden_size = controller_hidden_size
         self.hidden_act = hidden_act
         self.rms_norm_eps = rms_norm_eps
         self.initializer_range = initializer_range

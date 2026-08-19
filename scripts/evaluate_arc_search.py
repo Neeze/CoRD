@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-expansions", type=int, default=4)
     parser.add_argument("--beam-size", type=int, default=2)
     parser.add_argument("--max-verified-leaves", type=int, default=2)
+    parser.add_argument("--decode-max-new-tokens", type=int, default=1024)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -38,7 +39,7 @@ def main() -> None:
     if args.batch_size < 1:
         raise ValueError("batch-size must be positive")
     split = split_arc_training_files(discover_arc_tasks(args.data_dir / "training"), seed=args.seed)
-    dataset = ARCDataset(split.validation_files, augment=True, augmentation_seed=args.seed, split_name="validation")
+    dataset = ARCDataset(split.validation_files, augment=False, augmentation_seed=args.seed, split_name="validation")
     dataloader = DataLoader(dataset, args.batch_size, shuffle=False, collate_fn=partial(collate_fn, max_length=None))
     device = torch.device(args.device)
     model = CordForCausalLM.from_pretrained(args.checkpoint).to(device)
@@ -54,6 +55,7 @@ def main() -> None:
             seed=args.seed,
         ),
         max_steps=args.max_steps,
+        decode_max_new_tokens=args.decode_max_new_tokens,
     )
     report = {
         "split": "training-validation (never ARC evaluation)",
@@ -63,6 +65,7 @@ def main() -> None:
             "beam_size": args.beam_size,
             "max_verified_leaves": args.max_verified_leaves,
             "seed": args.seed,
+            "decode_max_new_tokens": args.decode_max_new_tokens,
         },
         "metrics": metrics,
     }

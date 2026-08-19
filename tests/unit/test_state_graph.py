@@ -131,9 +131,15 @@ def test_search_decodes_and_verifies_multiple_terminal_leaves():
     assert result.verified is not None and any(result.verified)
     assert result.decoded_tokens is not None
     assert result.rewards is not None and result.rewards.max().item() == 1.0
-    assert result.best_state_id == result.state_ids[1]
+    assert result.selected_index == 0
+    assert result.best_state_id == result.state_ids[result.selected_index]
+    assert result.oracle_best_reward == 1.0
+    # The verifier scores after policy selection and cannot replace best_state.
+    assert result.selected_reward == pytest.approx(result.rewards[result.selected_index].item())
     assert result.trajectory is not None and all("resource_cost" in record for record in result.trajectory)
     assert all(record["task_id"] == "task" for record in result.trajectory)
+    assert all("return" in record and "advantage" in record for record in result.trajectory)
+    assert result.replay_transitions
 
 
 def test_search_trajectory_records_merge_parents_and_replays_deterministically():

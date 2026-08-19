@@ -18,9 +18,17 @@ from torch.utils.tensorboard import SummaryWriter
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cord import CordConfig, CordForCausalLM, build_cord_optimizer_param_groups
+from cord import (
+    CordConfig,
+    CordForCausalLM,
+    CordGraphReplayBuffer,
+    CordSearchConfig,
+    build_cord_optimizer_param_groups,
+    build_graph_optimizer_param_groups,
+)
 from dataset.data import ARC_VOCAB_SIZE, ARCDataset, collate_fn, discover_arc_tasks, split_arc_training_files
-from trainer.trainer import evaluate, is_better_validation, train_epoch, validate_metrics
+from trainer.arc_search_evaluation import compare_direct_and_graph
+from trainer.trainer import evaluate, is_better_validation, train_epoch, train_graph_epoch, validate_metrics
 
 
 def unique_parameter_count(model: torch.nn.Module) -> int:
@@ -54,6 +62,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-optimizer-steps", type=int, default=None, help="Explicitly cap optimizer steps for smoke runs.")
     parser.add_argument("--resume-from", type=Path, default=None, help="Load a saved model checkpoint before training or --eval-only.")
     parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--graph-training-epochs", type=int, default=0, help="AWR/search-distillation epochs after SFT.")
+    parser.add_argument("--ppo-training-epochs", type=int, default=0, help="On-policy PPO epochs after AWR calibration.")
+    parser.add_argument("--ppo-clip", type=float, default=0.2)
+    parser.add_argument("--ppo-kl-weight", type=float, default=0.01)
+    parser.add_argument("--graph-max-expansions", type=int, default=4)
+    parser.add_argument("--graph-beam-size", type=int, default=4)
+    parser.add_argument("--graph-verified-leaves", type=int, default=4)
+    parser.add_argument("--graph-decode-max-new-tokens", type=int, default=1024)
+    parser.add_argument("--graph-replay-capacity", type=int, default=4096)
+    parser.add_argument("--graph-replay-batch-size", type=int, default=8)
+    parser.add_argument("--controller-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--backbone-lr-scale", type=float, default=0.1)
+    parser.add_argument("--awr-temperature", type=float, default=0.5)
+    parser.add_argument("--graph-policy-weight", type=float, default=1.0)
+    parser.add_argument("--local-bptt-weight", type=float, default=0.1)
+    parser.add_argument("--graph-decoder-weight", type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -80,6 +104,14 @@ def main() -> None:
     args = parse_args()
     if args.train_fraction != 0.8:
         raise ValueError("ARC audit contract requires --train-fraction 0.8")
+    if args.graph_training_epochs < 0:
+        raise ValueError("--graph-training-epochs cannot be negative")
+    if args.ppo_training_epochs < 0:
+        raise ValueError("--ppo-training-epochs cannot be negative")
+    if args.ppo_training_epochs and not args.graph_training_epochs:
+        raise ValueError("PPO requires at least one AWR graph-training epoch for calibration")
+    if args.graph_training_epochs and not args.eval_only and args.epochs < 1 and args.resume_from is None:
+        raise ValueError("graph training requires an SFT phase or --resume-from")
     seed_everything(args.seed)
     training_files = discover_arc_tasks(args.data_dir / "training")
     test_files = discover_arc_tasks(args.data_dir / "evaluation")
@@ -149,6 +181,13 @@ def main() -> None:
         ], lr=args.learning_rate)
         estimated_steps = max(1, (len(train_loader) * args.epochs + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps)
         scheduler = make_scheduler(optimizer, estimated_steps, args.warmup_ratio)
+        graph_search_config = CordSearchConfig(
+            max_expansions=args.graph_max_expansions,
+            beam_size=args.graph_beam_size,
+            max_verified_leaves=args.graph_verified_leaves,
+            deterministic=True,
+            seed=args.seed,
+        )
         metadata = {
             "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "parameter_count": parameter_count,
@@ -169,6 +208,12 @@ def main() -> None:
                     "max_new_tokens": "largest non-padding target completion in each batch",
                 },
                 "checkpoint_selection": ["task_exact", "grid_exact", "-loss"],
+                "state_graph": {
+                    "training_algorithm": "AWR + Monte Carlo value + local BPTT",
+                    "target_verifier_timing": "post-selection only",
+                    "reported_metrics": ["selected_solution_accuracy", "oracle_success_at_n"],
+                    "search_config": graph_search_config.__dict__,
+                },
             },
         }
         (output_dir / "run.json").write_text(json.dumps(metadata, indent=2, allow_nan=False), encoding="utf-8")
@@ -198,6 +243,114 @@ def main() -> None:
                     )
                 if args.smoke_optimizer_steps is not None and global_step >= args.smoke_optimizer_steps:
                     break
+            if args.graph_training_epochs or args.ppo_training_epochs:
+                if not best_dir.exists():
+                    raise FileNotFoundError("graph phase requires a finite SFT checkpoint")
+                sft_reference_dir = best_dir
+                model = CordForCausalLM.from_pretrained(sft_reference_dir).to(device)
+                graph_groups = build_graph_optimizer_param_groups(
+                    model,
+                    args.controller_learning_rate,
+                    backbone_lr_scale=args.backbone_lr_scale,
+                    weight_decay=args.weight_decay,
+                )
+                graph_optimizer = torch.optim.AdamW(graph_groups)
+                graph_estimated_steps = max(
+                    1, len(train_loader) * (args.graph_training_epochs + args.ppo_training_epochs)
+                )
+                graph_scheduler = make_scheduler(graph_optimizer, graph_estimated_steps, args.warmup_ratio)
+                replay_buffer = CordGraphReplayBuffer(args.graph_replay_capacity)
+                best_graph_metrics = None
+                best_graph_dir = output_dir / "best_graph"
+                graph_step_cap = (
+                    global_step + args.smoke_optimizer_steps
+                    if args.smoke_optimizer_steps is not None else None
+                )
+                reference_model = None
+                if args.ppo_training_epochs:
+                    reference_model = CordForCausalLM.from_pretrained(sft_reference_dir).to(device).eval()
+                    for parameter in reference_model.parameters():
+                        parameter.requires_grad_(False)
+                phase_specs = [
+                    ("awr", args.graph_training_epochs, None, None, 0.0),
+                    ("ppo", args.ppo_training_epochs, args.ppo_clip, reference_model, args.ppo_kl_weight),
+                ]
+                graph_epoch_index = 0
+                stop_graph = False
+                for phase_name, phase_epochs, ppo_clip, phase_reference, kl_weight in phase_specs:
+                    for phase_epoch in range(phase_epochs):
+                        train_dataset.set_epoch(args.epochs + graph_epoch_index)
+                        global_step, graph_train_metrics, replay_buffer = train_graph_epoch(
+                            model,
+                            train_loader,
+                            graph_optimizer,
+                            device,
+                            search_config=graph_search_config,
+                            replay_buffer=replay_buffer,
+                            replay_batch_size=args.graph_replay_batch_size,
+                            writer=writer,
+                            epoch=graph_epoch_index,
+                            global_step=global_step,
+                            max_steps=graph_step_cap,
+                            scheduler=graph_scheduler,
+                            max_grad_norm=args.max_grad_norm,
+                            policy_weight=args.graph_policy_weight,
+                            local_bptt_weight=args.local_bptt_weight,
+                            graph_decoder_weight=args.graph_decoder_weight,
+                            awr_temperature=args.awr_temperature,
+                            decode_max_new_tokens=args.graph_decode_max_new_tokens,
+                            ppo_clip=ppo_clip,
+                            reference_model=phase_reference,
+                            kl_weight=kl_weight,
+                        )
+                        validation_metrics = evaluate(
+                            model, validation_loader, device, writer, global_step,
+                            namespace=f"{phase_name}_val",
+                        )
+                        graph_validation = compare_direct_and_graph(
+                            model, validation_loader, device, search_config=graph_search_config,
+                            decode_max_new_tokens=args.graph_decode_max_new_tokens,
+                        )
+                        candidate = {**validation_metrics, **graph_validation, "phase": phase_name}
+                        print(f"phase={phase_name} epoch={phase_epoch} train={graph_train_metrics} val={candidate}")
+                        graph_score = (
+                            candidate["selected_solution_accuracy"],
+                            candidate["oracle_success_at_n"],
+                            candidate["task_exact"],
+                            -candidate["loss"],
+                        )
+                        best_graph_score = None if best_graph_metrics is None else (
+                            best_graph_metrics["selected_solution_accuracy"],
+                            best_graph_metrics["oracle_success_at_n"],
+                            best_graph_metrics["task_exact"],
+                            -best_graph_metrics["loss"],
+                        )
+                        if best_graph_score is None or graph_score > best_graph_score:
+                            best_graph_metrics = candidate
+                            model.save_pretrained(best_graph_dir)
+                            torch.save(
+                                {
+                                    "optimizer": graph_optimizer.state_dict(),
+                                    "scheduler": graph_scheduler.state_dict(),
+                                    "phase": phase_name,
+                                    "epoch": phase_epoch,
+                                    "global_step": global_step,
+                                    "validation_metrics": candidate,
+                                },
+                                best_graph_dir / "trainer_state.pt",
+                            )
+                            torch.save(replay_buffer.state_dict(), best_graph_dir / "graph_replay.pt")
+                            (output_dir / "best_graph_validation_metrics.json").write_text(
+                                json.dumps(candidate, indent=2, allow_nan=False), encoding="utf-8"
+                            )
+                        graph_epoch_index += 1
+                        if graph_step_cap is not None and global_step >= graph_step_cap:
+                            stop_graph = True
+                            break
+                    if stop_graph:
+                        break
+                if best_graph_dir.exists():
+                    best_dir = best_graph_dir
         checkpoint_dir = args.resume_from if args.eval_only and args.resume_from else best_dir
         if checkpoint_dir is None or not checkpoint_dir.exists():
             raise FileNotFoundError("no finite validation checkpoint exists; supply --resume-from for --eval-only")
@@ -205,10 +358,18 @@ def main() -> None:
         test_metrics = evaluate(model, test_loader, device, writer, global_step, namespace="test")
         validate_metrics(test_metrics)
         print(f"final_test={test_metrics}")
+        graph_test_metrics = None
+        if args.graph_training_epochs or args.ppo_training_epochs:
+            graph_test_metrics = compare_direct_and_graph(
+                model, test_loader, device, search_config=graph_search_config,
+                decode_max_new_tokens=args.graph_decode_max_new_tokens,
+            )
+            print(f"final_graph_test={graph_test_metrics}")
         final_artifacts = {
             "checkpoint": str(checkpoint_dir),
             "selection": metadata["evaluation_protocol"]["checkpoint_selection"],
             "teacher_forced_and_generated": test_metrics,
+            "state_graph": graph_test_metrics,
         }
         (output_dir / "final_test_metrics.json").write_text(json.dumps(final_artifacts, indent=2, allow_nan=False), encoding="utf-8")
         (output_dir / "run.json").write_text(json.dumps(metadata, indent=2, allow_nan=False), encoding="utf-8")

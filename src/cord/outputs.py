@@ -75,6 +75,16 @@ class CordSearchOutput(ModelOutput):
     resource_costs: Optional[torch.FloatTensor] = None
     trajectory: Optional[tuple[dict, ...]] = None
     num_expansions: Optional[int] = None
+    selected_state_id: Optional[str] = None
+    selected_index: Optional[int] = None
+    selected_reward: Optional[float] = None
+    oracle_best_reward: Optional[float] = None
+    returns: Optional[torch.FloatTensor] = None
+    advantages: Optional[torch.FloatTensor] = None
+    policy_log_probs: Optional[torch.FloatTensor] = None
+    action_parent_ids: Optional[tuple[Optional[str], ...]] = None
+    second_parent_ids: Optional[tuple[Optional[str], ...]] = None
+    replay_transitions: Optional[tuple[object, ...]] = None
 
 
 __all__ = [

@@ -14,6 +14,7 @@ from transformers.generation import GenerationMixin
 
 from .cache_utils import CordCache
 from .configuration_cord import CordConfig
+from .controller import CordStateController
 from .modules import (
     CordBlockAttnRes,
     CordCausalSelfAttention,
@@ -33,9 +34,11 @@ from .state_graph import (
     CordStateArchive,
     CordStateRecord,
     CordVerifierResult,
+    backup_graph_returns,
     state_fingerprint,
+    state_novelty,
 )
-from .training import CordLossTargets, compute_cord_loss
+from .training import CordGraphTransition, CordLossTargets, compute_cord_loss
 
 
 class CordConceptEncoder(nn.Module):
@@ -286,6 +289,12 @@ class CordModel(CordPreTrainedModel):
         self.rollback_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.merge_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.merge_cross_attention = CordCrossAttention(config)
+        self.state_controller = CordStateController(
+            config.hidden_size,
+            config.num_reasoning_operators,
+            dropout=config.loop_dropout,
+            controller_hidden_size=config.controller_hidden_size,
+        )
         self.post_init()
         nn.init.normal_(self.concept_encoder.slot_queries, mean=0.0, std=config.initializer_range)
         nn.init.normal_(self.operator_embeddings, mean=0.0, std=config.initializer_range)
@@ -657,13 +666,21 @@ class CordModel(CordPreTrainedModel):
         decode_state: Optional[Callable[[torch.Tensor, CordDecodeContext], list[int]]] = None,
         verifier: Optional[Callable[[list[int], CordDecodeContext], CordVerifierResult]] = None,
     ) -> CordSearchOutput:
-        """Run bounded beam/UCB search over detached concept states."""
+        """Run learned, bounded latent-state search and offline reward backup.
+
+        The target verifier is applied only after the controller has ranked and
+        selected terminal leaves.  Consequently ``selected_state_id`` is a
+        deployable policy decision, while ``oracle_best_reward`` is reported as
+        a separate success@N diagnostic.
+        """
 
         if input_ids.shape[0] != 1:
             raise ValueError("Cord v1 search currently accepts one prompt at a time")
         search_config = search_config or CordSearchConfig()
         if prefix_lengths is None:
             prefix_lengths = input_ids.new_tensor([input_ids.shape[1]])
+        if verifier is not None and (decode_context is None or decode_state is None):
+            raise ValueError("decoded verification requires both decode_context and decode_state")
         packet = self.encode_prompt(input_ids, prefix_lengths)
         root_state = packet.states[0].detach()
         archive = CordStateArchive(
@@ -681,147 +698,324 @@ class CordModel(CordPreTrainedModel):
         root_id = state_fingerprint(root_state)
         archive.add(
             CordStateRecord(
-                root_id,
-                (),
-                CordOperator.CONTINUE,
-                0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                root_id,
-                search_config.seed,
-                state=root_state,
+                root_id, (), CordOperator.CONTINUE, 0, 0.0, 0.0, 0.0, 1.0,
+                root_id, search_config.seed, state=root_state,
             )
         )
+        current_id = root_id
         frontier = [root_id]
-        expanded_pairs: set[tuple[str, CordOperator]] = set()
+        terminal_ids: list[str] = []
+        expanded_actions: set[tuple[str, CordOperator, Optional[str]]] = set()
+        replay_contexts: dict[str, dict] = {}
         generator = torch.Generator(device=input_ids.device).manual_seed(search_config.seed)
+        operator_values = list(CordOperator)
+
         for expansion_index in range(search_config.max_expansions):
-            candidates: list[tuple[float, CordStateRecord, torch.Tensor]] = []
-            for parent_id in frontier:
-                parent = archive.get(parent_id)
-                parent_state = archive.materialize(parent_id, replay_state, input_ids.device)
-                for operator in CordOperator:
-                    if operator is CordOperator.HALT or (parent_id, operator) in expanded_pairs:
-                        continue
-                    expanded_pairs.add((parent_id, operator))
-                    other_id = None
-                    if operator is CordOperator.MERGE and frontier[0] != parent_id:
-                        other_id = frontier[0]
-                    elif operator is CordOperator.ROLLBACK and parent.parent_ids:
-                        other_id = parent.parent_ids[0]
-                        # Prefer an older archived ancestor when available: rollback
-                        # is a graph operation, not merely an undo of the last edge.
-                        while archive.get(other_id).parent_ids:
-                            other_id = archive.get(other_id).parent_ids[0]
-                    other_state = (
-                        archive.materialize(other_id, replay_state, input_ids.device)
-                        if other_id is not None
-                        else None
-                    )
-                    state = self._operator_state(parent_state, operator, other_state).detach()
-                    fingerprint = state_fingerprint(state)
-                    if any(record.fingerprint == fingerprint for record in archive.records.values()):
-                        continue
-                    pooled = state.mean(dim=0)
-                    value = float(self.value_head(pooled).item())
-                    uncertainty = float(F.softplus(self.uncertainty_head(pooled)).item())
-                    novelty = 1.0
-                    random_bonus = (
-                        float(torch.rand((), generator=generator, device=state.device).item())
-                        if not search_config.deterministic
-                        else 0.0
-                    )
-                    score = value + search_config.exploration_weight * (uncertainty + random_bonus)
-                    score += search_config.novelty_weight * novelty
-                    score -= search_config.compute_cost_weight * (parent.depth + 1)
-                    score -= search_config.memory_cost_weight * float(archive.hot_residency)
-                    state_id = hashlib_state_id(parent_id, operator.value, expansion_index, fingerprint)
-                    reward = value
-                    verified = False
-                    record = CordStateRecord(
-                        state_id,
-                        (parent_id,) if other_state is None else (parent_id, frontier[0]),
-                        operator,
-                        parent.depth + 1,
-                        value,
-                        reward,
-                        uncertainty,
-                        novelty,
-                        fingerprint,
-                        search_config.seed + expansion_index,
-                        verified,
-                        provenance_ids=tuple(range(state.shape[0])),
-                        state=state,
-                    )
-                    candidates.append((score, record, state))
+            action_ids = [
+                state_id for state_id, record in archive.records.items()
+                if not record.terminal and record.operator is not CordOperator.HALT
+            ]
+            if not action_ids:
+                break
+            archive_states = torch.stack(
+                [archive.materialize(state_id, replay_state, input_ids.device) for state_id in action_ids]
+            )
+            current_state = archive.materialize(current_id, replay_state, input_ids.device)
+            budget_remaining = (search_config.max_expansions - expansion_index) / max(search_config.max_expansions, 1)
+            controller_output = self.state_controller(
+                current_state, archive_states, root_state, budget_remaining
+            )
+            temperature = search_config.controller_temperature
+            parent_log_probs = F.log_softmax(controller_output.parent_logits[0] / temperature, dim=-1)
+            operator_log_probs = F.log_softmax(controller_output.operator_logits[0] / temperature, dim=-1)
+            second_log_probs = F.log_softmax(controller_output.second_parent_logits[0] / temperature, dim=-1)
+            candidates: list[tuple[float, float, int, int, int]] = []
+            for parent_index, parent_id in enumerate(action_ids):
+                for operator_index, operator in enumerate(operator_values):
+                    base_log_prob = parent_log_probs[parent_index] + operator_log_probs[parent_index, operator_index]
+                    second_indices = [-1]
+                    if operator is CordOperator.MERGE:
+                        if len(action_ids) < 2:
+                            continue
+                        if search_config.deterministic:
+                            second_indices = [
+                                int(index) for index in torch.topk(
+                                    second_log_probs[parent_index],
+                                    k=min(search_config.beam_size, len(action_ids) - 1),
+                                ).indices.tolist()
+                            ]
+                        else:
+                            second_indices = [int(torch.multinomial(
+                                second_log_probs[parent_index].exp(), 1, generator=generator
+                            ).item())]
+                    for second_index in second_indices:
+                        second_id = action_ids[second_index] if second_index >= 0 else None
+                        log_prob = base_log_prob
+                        if second_index >= 0:
+                            log_prob = log_prob + second_log_probs[parent_index, second_index]
+                        action_key = (parent_id, operator, second_id)
+                        if action_key in expanded_actions:
+                            continue
+                        uncertainty = float(controller_output.uncertainties[0, parent_index].item())
+                        parent_novelty = archive.get(parent_id).novelty
+                        score = float(log_prob.item())
+                        score += search_config.exploration_weight * uncertainty
+                        score += search_config.novelty_weight * parent_novelty
+                        score -= search_config.compute_cost_weight * (archive.get(parent_id).depth + 1)
+                        score -= search_config.memory_cost_weight * float(archive.hot_residency)
+                        if not search_config.deterministic:
+                            uniform = torch.rand((), generator=generator, device=input_ids.device).clamp_(1e-6, 1 - 1e-6)
+                            score += float((-torch.log(-torch.log(uniform))).item())
+                        candidates.append((score, float(log_prob.item()), parent_index, operator_index, second_index))
             if not candidates:
                 break
-            candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-            frontier = []
-            for _, record, _ in candidates[: search_config.beam_size]:
-                archive.add(record)
-                frontier.append(record.state_id)
-        terminal_ids: list[str] = []
-        if frontier:
-            if verifier is not None and (decode_context is None or decode_state is None):
-                raise ValueError("decoded verification requires both decode_context and decode_state")
-            for terminal_index, terminal_parent in enumerate(frontier[: search_config.max_verified_leaves]):
-                terminal_state = archive.materialize(terminal_parent, replay_state, input_ids.device)
-                terminal_id = hashlib_state_id(
-                    terminal_parent,
-                    CordOperator.HALT.value,
-                    len(archive.records),
-                    state_fingerprint(terminal_state),
-                )
-                terminal_record = archive.get(terminal_parent)
-                decoded_tokens: tuple[int, ...] = ()
-                result = None
-                if decode_state is not None and decode_context is not None:
-                    decoded_tokens = tuple(int(token) for token in decode_state(terminal_state, decode_context))
-                if verifier is not None:
-                    result = verifier(list(decoded_tokens), decode_context)
-                    if not isinstance(result, CordVerifierResult):
-                        raise TypeError("state-graph verifier must return CordVerifierResult")
-                terminal_reward = result.reward if result is not None else terminal_record.reward
-                terminal_verified = bool(result is not None and result.valid and result.exact_reward > 0.0)
-                resource_cost = float(terminal_record.depth + 1 + len(decoded_tokens))
-                archive.add(
-                    CordStateRecord(
-                        terminal_id,
-                        (terminal_parent,),
-                        CordOperator.HALT,
-                        terminal_record.depth + 1,
-                        terminal_record.value,
-                        terminal_reward,
-                        terminal_record.uncertainty,
-                        terminal_record.novelty,
-                        state_fingerprint(terminal_state),
-                        search_config.seed + terminal_index,
-                        terminal_verified,
-                        provenance_ids=terminal_record.provenance_ids,
-                        decoded_tokens=decoded_tokens,
-                        verifier_valid=result.valid if result is not None else None,
-                        verifier_reason=result.reason if result is not None else "",
-                        resource_cost=resource_cost,
-                        state=terminal_state,
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            next_frontier: list[str] = []
+            for score, log_prob, parent_index, operator_index, second_index in candidates[: search_config.beam_size]:
+                operator = operator_values[operator_index]
+                action_parent_id = action_ids[parent_index]
+                second_parent_id = action_ids[second_index] if second_index >= 0 else None
+                expanded_actions.add((action_parent_id, operator, second_parent_id))
+                action_parent_state = archive.materialize(action_parent_id, replay_state, input_ids.device)
+                value = float(controller_output.values[0, parent_index].item())
+                uncertainty = float(controller_output.uncertainties[0, parent_index].item())
+                if operator is CordOperator.HALT:
+                    state = action_parent_state
+                    parent_ids = (action_parent_id,)
+                    transition_parent = action_parent_state
+                    transition_other = None
+                    terminal = True
+                elif operator is CordOperator.ROLLBACK:
+                    transition_parent = current_state
+                    transition_other = action_parent_state
+                    state = self._operator_state(transition_parent, operator, transition_other).detach()
+                    parent_ids = (current_id, action_parent_id)
+                    terminal = False
+                else:
+                    transition_parent = action_parent_state
+                    transition_other = (
+                        archive.materialize(second_parent_id, replay_state, input_ids.device)
+                        if second_parent_id is not None else None
                     )
+                    state = self._operator_state(transition_parent, operator, transition_other).detach()
+                    parent_ids = (action_parent_id,) if second_parent_id is None else (action_parent_id, second_parent_id)
+                    terminal = False
+                fingerprint = state_fingerprint(state)
+                duplicate = operator is not CordOperator.HALT and any(
+                    record.fingerprint == fingerprint for record in archive.records.values()
                 )
-                terminal_ids.append(terminal_id)
-        if terminal_ids:
-            frontier = terminal_ids
-        records = [archive.get(state_id) for state_id in frontier]
-        best = (
-            max(records, key=lambda record: (record.verified, record.reward, record.value))
-            if records
-            else archive.get(root_id)
+                novelty = state_novelty(
+                    state,
+                    [archive.materialize(state_id, replay_state, input_ids.device) for state_id in action_ids],
+                )
+                state_id = hashlib_state_id(action_parent_id, operator.value, expansion_index, fingerprint)
+                while state_id in archive.records:
+                    state_id += "x"
+                record = CordStateRecord(
+                    state_id=state_id,
+                    parent_ids=parent_ids,
+                    operator=operator,
+                    depth=max(archive.get(parent_id).depth for parent_id in parent_ids) + 1,
+                    value=value,
+                    reward=-search_config.cycle_penalty if duplicate else 0.0,
+                    uncertainty=uncertainty,
+                    novelty=novelty,
+                    fingerprint=fingerprint,
+                    rng_seed=search_config.seed + expansion_index,
+                    provenance_ids=tuple(range(state.shape[0])),
+                    state=state,
+                    action_parent_id=action_parent_id,
+                    second_parent_id=second_parent_id,
+                    policy_log_prob=log_prob,
+                    selection_score=score,
+                    terminal=terminal or duplicate,
+                    cycle_detected=duplicate,
+                    exact_reward=-search_config.cycle_penalty if duplicate else 0.0,
+                )
+                archive.add(record)
+                replay_contexts[state_id] = {
+                    "current_state": current_state.detach(),
+                    "archive_states": archive_states.detach(),
+                    "goal_state": root_state.detach(),
+                    "budget_remaining": budget_remaining,
+                    "parent_index": parent_index,
+                    "operator_index": operator_index,
+                    "second_parent_index": second_index,
+                    "parent_state": transition_parent.detach(),
+                    "second_parent_state": None if transition_other is None else transition_other.detach(),
+                    "child_state": state.detach(),
+                }
+                if record.terminal:
+                    terminal_ids.append(state_id)
+                else:
+                    next_frontier.append(state_id)
+            if next_frontier:
+                frontier = next_frontier
+                current_id = max(next_frontier, key=lambda state_id: archive.get(state_id).selection_score)
+            elif terminal_ids:
+                break
+
+        # A bounded rollout always exposes policy-ranked terminal candidates.
+        # Automatic halts are added only for live leaves not already selected by
+        # the learned HALT action.
+        ranked_live = sorted(
+            [state_id for state_id in frontier if not archive.get(state_id).terminal],
+            key=lambda state_id: archive.get(state_id).selection_score,
+            reverse=True,
         )
-        best_state = archive.materialize(best.state_id, replay_state, input_ids.device)
+        halt_action_ids = [
+            state_id for state_id, record in archive.records.items()
+            if not record.terminal and record.operator is not CordOperator.HALT
+        ]
+        halt_archive_states = (
+            torch.stack([archive.materialize(state_id, replay_state, input_ids.device) for state_id in halt_action_ids])
+            if halt_action_ids else root_state.unsqueeze(0)
+        )
+        halt_current_state = archive.materialize(current_id, replay_state, input_ids.device)
+        halt_output = self.state_controller(halt_current_state, halt_archive_states, root_state, 0.0)
+        halt_operator_index = operator_values.index(CordOperator.HALT)
+        halt_parent_log_probs = F.log_softmax(halt_output.parent_logits[0], dim=-1)
+        halt_operator_log_probs = F.log_softmax(halt_output.operator_logits[0], dim=-1)
+        for terminal_parent in ranked_live:
+            if len(terminal_ids) >= search_config.max_verified_leaves:
+                break
+            terminal_state = archive.materialize(terminal_parent, replay_state, input_ids.device)
+            terminal_parent_record = archive.get(terminal_parent)
+            halt_parent_index = halt_action_ids.index(terminal_parent)
+            halt_log_prob = float(
+                (halt_parent_log_probs[halt_parent_index] + halt_operator_log_probs[halt_parent_index, halt_operator_index]).item()
+            )
+            terminal_id = hashlib_state_id(
+                terminal_parent, CordOperator.HALT.value, len(archive.records), state_fingerprint(terminal_state)
+            )
+            while terminal_id in archive.records:
+                terminal_id += "x"
+            terminal_record = CordStateRecord(
+                state_id=terminal_id,
+                parent_ids=(terminal_parent,),
+                operator=CordOperator.HALT,
+                depth=terminal_parent_record.depth + 1,
+                value=terminal_parent_record.value,
+                reward=0.0,
+                uncertainty=terminal_parent_record.uncertainty,
+                novelty=terminal_parent_record.novelty,
+                fingerprint=state_fingerprint(terminal_state),
+                rng_seed=search_config.seed + len(terminal_ids),
+                provenance_ids=terminal_parent_record.provenance_ids,
+                state=terminal_state,
+                action_parent_id=terminal_parent,
+                policy_log_prob=halt_log_prob,
+                selection_score=halt_log_prob + terminal_parent_record.selection_score,
+                terminal=True,
+            )
+            archive.add(terminal_record)
+            replay_contexts[terminal_id] = {
+                "current_state": halt_current_state.detach(),
+                "archive_states": halt_archive_states.detach(),
+                "goal_state": root_state.detach(),
+                "budget_remaining": 0.0,
+                "parent_index": halt_parent_index,
+                "second_parent_index": -1,
+                "operator_index": halt_operator_index,
+                "parent_state": terminal_state.detach(),
+                "second_parent_state": None,
+                "child_state": terminal_state.detach(),
+            }
+            terminal_ids.append(terminal_id)
+
+        terminal_ids = sorted(
+            dict.fromkeys(terminal_ids),
+            key=lambda state_id: archive.get(state_id).selection_score,
+            reverse=True,
+        )[: search_config.max_verified_leaves]
+        if not terminal_ids:
+            terminal_ids = [root_id]
+            archive.get(root_id).terminal = True
+        selected_state_id = terminal_ids[0]
+
+        # Verification is strictly post-selection and cannot change the chosen leaf.
+        for terminal_index, terminal_id in enumerate(terminal_ids):
+            record = archive.get(terminal_id)
+            terminal_state = archive.materialize(terminal_id, replay_state, input_ids.device)
+            decoded_tokens: tuple[int, ...] = ()
+            result = None
+            if decode_state is not None and decode_context is not None and not record.cycle_detected:
+                decoded_tokens = tuple(int(token) for token in decode_state(terminal_state, decode_context))
+            if verifier is not None and not record.cycle_detected:
+                result = verifier(list(decoded_tokens), decode_context)
+                if not isinstance(result, CordVerifierResult):
+                    raise TypeError("state-graph verifier must return CordVerifierResult")
+            exact = record.exact_reward if result is None else float(result.exact_reward)
+            if result is None or exact > 0.0:
+                shaping = 0.0
+            else:
+                partial = max(-1.0, min(1.0, float(result.shaping_reward)))
+                shaping = search_config.shaping_reward_clip * partial
+                if result.valid:
+                    shaping += search_config.valid_reward
+            record.decoded_tokens = decoded_tokens
+            record.exact_reward = exact
+            record.shaping_reward = shaping
+            record.reward = exact + shaping
+            record.verified = bool(result is not None and result.valid and exact > 0.0)
+            record.verifier_valid = result.valid if result is not None else None
+            record.verifier_reason = result.reason if result is not None else ("cycle" if record.cycle_detected else "")
+            record.resource_cost = float(record.depth + len(decoded_tokens))
+
+        backup_graph_returns(
+            archive.records,
+            discount=search_config.discount,
+            compute_cost_weight=search_config.compute_cost_weight,
+            decode_cost_weight=search_config.decode_cost_weight,
+        )
+        replay_transitions = []
+        for state_id, context in replay_contexts.items():
+            record = archive.get(state_id)
+            chain_ids = []
+            cursor = state_id
+            while cursor in replay_contexts and len(chain_ids) < self.config.local_bptt_loops:
+                cursor_context = replay_contexts[cursor]
+                if operator_values[cursor_context["operator_index"]] is not CordOperator.HALT:
+                    chain_ids.append(cursor)
+                parents = archive.get(cursor).parent_ids
+                if not parents:
+                    break
+                cursor = parents[0]
+            chain_ids.reverse()
+            local_initial_state = replay_contexts[chain_ids[0]]["parent_state"] if chain_ids else None
+            replay_transitions.append(
+                CordGraphTransition(
+                    **context,
+                    behavior_log_prob=record.policy_log_prob,
+                    return_value=record.return_value,
+                    advantage=record.advantage,
+                    terminal=record.terminal,
+                    exact_reward=record.exact_reward,
+                    local_initial_state=local_initial_state,
+                    local_operator_indices=tuple(
+                        replay_contexts[item]["operator_index"] for item in chain_ids
+                    ),
+                    local_second_parent_states=tuple(
+                        replay_contexts[item]["second_parent_state"] for item in chain_ids
+                    ),
+                    local_target_states=tuple(
+                        replay_contexts[item]["child_state"] for item in chain_ids
+                    ),
+                )
+            )
+
+        records = [archive.get(state_id) for state_id in terminal_ids]
+        selected_index = terminal_ids.index(selected_state_id)
+        selected = records[selected_index]
+        best_state = archive.materialize(selected_state_id, replay_state, input_ids.device)
         prompt_identity = hashlib.sha1(input_ids.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
         return CordSearchOutput(
             best_state=best_state,
-            best_state_id=best.state_id,
+            best_state_id=selected_state_id,
+            selected_state_id=selected_state_id,
+            selected_index=selected_index,
+            selected_reward=selected.reward,
+            oracle_best_reward=max(record.reward for record in records),
             state_ids=tuple(record.state_id for record in records),
             parent_ids=tuple(record.parent_ids[0] if record.parent_ids else "" for record in records),
             operators=tuple(record.operator.value for record in records),
@@ -834,26 +1028,42 @@ class CordModel(CordPreTrainedModel):
             verifier_valid=tuple(record.verifier_valid for record in records),
             verifier_reasons=tuple(record.verifier_reason for record in records),
             resource_costs=torch.tensor([record.resource_cost for record in records], device=input_ids.device),
+            returns=torch.tensor([record.return_value for record in records], device=input_ids.device),
+            advantages=torch.tensor([record.advantage for record in records], device=input_ids.device),
+            policy_log_probs=torch.tensor([record.policy_log_prob for record in records], device=input_ids.device),
+            action_parent_ids=tuple(record.action_parent_id for record in records),
+            second_parent_ids=tuple(record.second_parent_id for record in records),
+            replay_transitions=tuple(replay_transitions),
             trajectory=tuple(
                 {
                     "task_id": decode_context.task_id if decode_context is not None else None,
                     "prompt_identity": prompt_identity,
                     "state_id": record.state_id,
                     "parent_ids": record.parent_ids,
+                    "action_parent_id": record.action_parent_id,
+                    "second_parent_id": record.second_parent_id,
                     "operator": record.operator.value,
                     "depth": record.depth,
                     "value": record.value,
                     "reward": record.reward,
+                    "return": record.return_value,
+                    "advantage": record.advantage,
+                    "policy_log_prob": record.policy_log_prob,
+                    "selection_score": record.selection_score,
                     "uncertainty": record.uncertainty,
+                    "novelty": record.novelty,
+                    "cycle_detected": record.cycle_detected,
+                    "terminal": record.terminal,
                     "decoded_tokens": record.decoded_tokens,
                     "verifier_valid": record.verifier_valid,
                     "verifier_reason": record.verifier_reason,
                     "rng_seed": record.rng_seed,
                     "resource_cost": record.resource_cost,
+                    "selected": record.state_id == selected_state_id,
                 }
                 for record in archive.records.values()
             ),
-            num_expansions=len(archive.records) - 1,
+            num_expansions=sum(record.operator is not CordOperator.HALT for record in archive.records.values()) - 1,
         )
 
 
@@ -925,6 +1135,46 @@ class CordForCausalLM(CordPreTrainedModel, GenerationMixin):
                 break
             current = current.new_tensor([[token]])
         return decoded
+
+    def concept_state_loss(
+        self,
+        concept_state: torch.Tensor,
+        target_ids: torch.LongTensor,
+        *,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        """Teacher-force a replayed leaf while preserving gradients to that leaf."""
+
+        if concept_state.ndim != 2:
+            raise ValueError("a replayed graph leaf must have shape (concept_slots, hidden_size)")
+        if target_ids.ndim == 1:
+            target_ids = target_ids.unsqueeze(0)
+        if target_ids.ndim != 2 or target_ids.shape[0] != 1:
+            raise ValueError("graph decoder targets must contain exactly one completion")
+        target_ids = target_ids.to(device=concept_state.device, dtype=torch.long)
+        decoder_input = target_ids.new_full(target_ids.shape, self.config.pad_token_id)
+        decoder_input[:, 0] = self.config.bos_token_id
+        if target_ids.shape[1] > 1:
+            decoder_input[:, 1:] = target_ids[:, :-1].masked_fill(
+                target_ids[:, :-1].eq(ignore_index), self.config.pad_token_id
+            )
+        state = concept_state.unsqueeze(0)
+        cache = CordCache(
+            len(self.model.decoder_layers),
+            concept_states=state,
+            concept_confidence=torch.ones(state.shape[:2], dtype=state.dtype, device=state.device),
+            prefix_lengths=target_ids.new_zeros((1,)),
+        )
+        output = self(
+            input_ids=decoder_input,
+            attention_mask=decoder_input.ne(self.config.pad_token_id),
+            past_key_values=cache,
+            use_cache=False,
+        )
+        valid = target_ids.ne(ignore_index)
+        if not valid.any():
+            raise ValueError("graph decoder targets contain no supervised token")
+        return F.cross_entropy(output.logits[valid], target_ids[valid])
 
     def search(
         self,

@@ -30,6 +30,12 @@ class CordSearchConfig:
     deterministic: bool = True
     seed: int = 0
     max_verified_leaves: int = 4
+    discount: float = 0.99
+    cycle_penalty: float = 0.1
+    decode_cost_weight: float = 0.001
+    controller_temperature: float = 1.0
+    shaping_reward_clip: float = 0.2
+    valid_reward: float = 0.01
 
     def __post_init__(self) -> None:
         if self.max_expansions < 0:
@@ -42,6 +48,16 @@ class CordSearchConfig:
             raise ValueError("exploration and compute-cost weights must be non-negative")
         if self.memory_cost_weight < 0.0 or self.novelty_weight < 0.0:
             raise ValueError("memory and novelty weights must be non-negative")
+        if not 0.0 <= self.discount <= 1.0:
+            raise ValueError("discount must be between zero and one")
+        if self.cycle_penalty < 0.0 or self.decode_cost_weight < 0.0:
+            raise ValueError("cycle and decode-cost weights must be non-negative")
+        if self.controller_temperature <= 0.0:
+            raise ValueError("controller_temperature must be positive")
+        if self.shaping_reward_clip < 0.0:
+            raise ValueError("shaping_reward_clip must be non-negative")
+        if self.valid_reward < 0.0:
+            raise ValueError("valid_reward must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -89,6 +105,16 @@ class CordStateRecord:
     resource_cost: float = 0.0
     state: Optional[torch.Tensor] = field(default=None, repr=False)
     checkpoint: Optional[torch.Tensor] = field(default=None, repr=False)
+    action_parent_id: Optional[str] = None
+    second_parent_id: Optional[str] = None
+    policy_log_prob: float = 0.0
+    selection_score: float = 0.0
+    return_value: float = 0.0
+    advantage: float = 0.0
+    exact_reward: float = 0.0
+    shaping_reward: float = 0.0
+    terminal: bool = False
+    cycle_detected: bool = False
 
 
 def state_fingerprint(state: torch.Tensor) -> str:
@@ -97,6 +123,54 @@ def state_fingerprint(state: torch.Tensor) -> str:
     normalized = torch.nn.functional.normalize(state.detach().float().reshape(-1), dim=0)
     quantized = (normalized.clamp(-4, 4) * 127).round().to(torch.int8).cpu().contiguous()
     return hashlib.sha1(quantized.numpy().tobytes()).hexdigest()
+
+
+def state_novelty(state: torch.Tensor, archive_states: list[torch.Tensor]) -> float:
+    """Cosine-distance novelty against materialized archived concept packets."""
+
+    if not archive_states:
+        return 1.0
+    candidate = torch.nn.functional.normalize(state.detach().float().reshape(-1), dim=0)
+    similarities = []
+    for archived in archive_states:
+        reference = torch.nn.functional.normalize(archived.detach().float().reshape(-1), dim=0)
+        similarities.append(torch.dot(candidate, reference).clamp(-1.0, 1.0))
+    maximum_similarity = torch.stack(similarities).max()
+    return float(((1.0 - maximum_similarity) * 0.5).clamp(0.0, 1.0).item())
+
+
+def backup_graph_returns(
+    records: dict[str, CordStateRecord],
+    *,
+    discount: float = 0.99,
+    compute_cost_weight: float = 0.0,
+    decode_cost_weight: float = 0.0,
+) -> None:
+    """Monte-Carlo/max backup of verified terminal returns through a latent DAG.
+
+    The update is deliberately offline: terminal verification is completed
+    before any result is propagated, so the verifier never becomes an action
+    selector during the episode.
+    """
+
+    children: dict[str, list[CordStateRecord]] = {state_id: [] for state_id in records}
+    for record in records.values():
+        for parent_id in record.parent_ids:
+            if parent_id in children:
+                children[parent_id].append(record)
+    ordered = sorted(records.values(), key=lambda item: item.depth, reverse=True)
+    for record in ordered:
+        if record.terminal:
+            terminal_reward = record.exact_reward + record.shaping_reward
+            terminal_reward -= decode_cost_weight * len(record.decoded_tokens)
+            record.return_value = terminal_reward
+        elif children[record.state_id]:
+            record.return_value = max(
+                discount * child.return_value - compute_cost_weight for child in children[record.state_id]
+            )
+        else:
+            record.return_value = -compute_cost_weight
+        record.advantage = record.return_value - record.value
 
 
 class CordStateArchive:
@@ -193,7 +267,11 @@ class CordStateArchive:
 __all__ = [
     "CordOperator",
     "CordSearchConfig",
+    "CordDecodeContext",
+    "CordVerifierResult",
     "CordStateRecord",
     "CordStateArchive",
     "state_fingerprint",
+    "state_novelty",
+    "backup_graph_returns",
 ]

@@ -34,22 +34,15 @@ Before a full run, use a tiny one-task overfit/generation test. A decreasing tea
 
 The current CLI still uses unconstrained greedy generation. Malformed, missing-EOS, or invalid-token completions are counted as failures. Grammar-constrained decoding is a separate future ablation, not part of the baseline score.
 
-The state-graph search remains a separate no-grad research path. It can now decode a bounded set of terminal concept leaves through the normal decoder cache and score them with the typed offline ARC verifier. Each returned trajectory includes parent IDs, operator, decoded tokens, verifier outcome, seed, and resource cost. This is a measurement seam only: it does not train or tune the model against evaluation tasks.
+The state-graph rollout remains no-grad so archive depth does not create an unbounded autograd graph. It now uses a learned hierarchical parent/operator/merge controller, decodes a bounded set of policy-ranked terminal leaves, applies the typed offline ARC verifier only after selection, backs terminal returns through the DAG, and emits replayable transitions. `--graph-training-epochs` recomputes controller/value losses and bounded local transitions from training-split replay.
 
 `scripts/evaluate_arc_search.py --checkpoint <best-checkpoint>` reports direct greedy and graph-search outcomes on the deterministic training-validation partition only. Its report deliberately includes decoded-leaf count and resource cost so a multi-leaf search is not presented as compute-equivalent to one direct decode. Phase 5 remains gated until this report demonstrates a reproducible, meaningful held-out comparison.
 
 The distinction is deliberate: teacher forcing measures token prediction under the correct target prefix; autoregressive generation measures actual ARC solving without target leakage.
 
 
-## Audit boundary and research gaps
+## Remaining scale-up gaps
 
-This is a supervised prefix-causal ARC data and training pipeline, not an implementation of the proposed reward-guided recurrent state graph research program. Current CoRD state search is no-grad heuristic inference. The repository does **not** yet implement:
+The 50M pipeline implements phase-one search distillation/AWR, Monte Carlo value targets, uncertainty calibration, learned halt actions, replay, and local truncated BPTT. Clipped PPO is available as a loss mode but is deliberately not the default before value calibration. Remaining scale-up work includes truly bounded cold storage across unlimited archive depth, Muon, distributed/expert-parallel reduction, production fused attention/KDA kernels, and empirical calibration at sufficient rollout volume.
 
-- learned state/operator controller or transition Q policy;
-- return backup, TD/Monte-Carlo state targets, advantage routing, or search trajectory replay/distillation;
-- graph-local BPTT with replayable archived transitions;
-- truly bounded cold checkpoint storage across unlimited archive depth;
-- calibrated value/uncertainty/halting losses from ARC targets;
-- Muon, distributed training/expert-parallel reduction, or production fused attention/KDA kernels.
-
-The value, uncertainty, halting, and router diagnostics logged by the pipeline therefore must not be interpreted as validated state-graph quality metrics. These require separately designed targets, verifier contracts, baselines, and evaluation.
+Value, uncertainty, halt, and policy diagnostics become meaningful only after graph training; randomly initialized heads from an SFT-only checkpoint are still uncalibrated.

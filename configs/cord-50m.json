@@ -26,6 +26,7 @@
   "use_moe": true,
   "use_situ_glu": true,
   "num_reasoning_operators": 5,
+  "controller_hidden_size": 64,
   "hot_frontier_size": 8,
   "hot_frontier_max_size": 16,
   "gpu_checkpoint_slots": 4,

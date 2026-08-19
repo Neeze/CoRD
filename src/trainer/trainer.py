@@ -12,7 +12,13 @@ import torch
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
-from cord.training import update_router_biases
+from cord import CordGraphReplayBuffer, CordSearchConfig
+from cord.training import (
+    compute_graph_decoder_loss,
+    compute_graph_policy_loss,
+    compute_local_transition_loss,
+    update_router_biases,
+)
 from dataset.data import EOS_TOKEN, GRID_OFFSET, IGNORE_INDEX, PAD_TOKEN, ROW_SEP
 
 
@@ -362,6 +368,208 @@ def train_epoch(
     return global_step, aggregate
 
 
+def train_graph_epoch(
+    model: torch.nn.Module,
+    dataloader: Iterable[dict[str, Any]],
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    *,
+    search_config: CordSearchConfig,
+    replay_buffer: CordGraphReplayBuffer | None = None,
+    replay_batch_size: int = 8,
+    writer: Any = None,
+    epoch: int = 0,
+    global_step: int = 0,
+    max_steps: int | None = None,
+    scheduler: Any = None,
+    max_grad_norm: float | None = None,
+    lm_weight: float = 1.0,
+    policy_weight: float = 1.0,
+    local_bptt_weight: float = 0.1,
+    graph_decoder_weight: float = 0.1,
+    awr_temperature: float = 0.5,
+    max_advantage_weight: float = 20.0,
+    decode_max_new_tokens: int = 1024,
+    ppo_clip: float | None = None,
+    reference_model: torch.nn.Module | None = None,
+    kl_weight: float = 0.0,
+) -> tuple[int, dict[str, float], CordGraphReplayBuffer]:
+    """Collect verified training rollouts and optimize SFT + AWR + local BPTT.
+
+    This is intentionally a training-only API.  ARC targets serve as offline
+    terminal verifiers after policy selection; validation/test evaluation uses
+    :func:`compare_direct_and_graph`, which reports selected and oracle outcomes
+    separately and performs no parameter update.
+    """
+
+    from .arc_verifier import ARCDecodedVerifier
+
+    if replay_batch_size < 1:
+        raise ValueError("replay_batch_size must be positive")
+    if decode_max_new_tokens < 1:
+        raise ValueError("decode_max_new_tokens must be positive")
+    if min(lm_weight, policy_weight, local_bptt_weight, graph_decoder_weight, kl_weight) < 0.0:
+        raise ValueError("graph training loss weights must be non-negative")
+    if ppo_clip is not None and ppo_clip <= 0.0:
+        raise ValueError("ppo_clip must be positive")
+    if kl_weight and reference_model is None:
+        raise ValueError("KL regularization requires a frozen reference_model")
+    replay_buffer = CordGraphReplayBuffer() if replay_buffer is None else replay_buffer
+    metrics = ARCMetrics()
+    graph_loss_sum = 0.0
+    policy_loss_sum = 0.0
+    local_loss_sum = 0.0
+    decoder_loss_sum = 0.0
+    kl_loss_sum = 0.0
+    selected_exact = 0
+    oracle_exact = 0
+    rollout_count = 0
+    graph_steps = 0
+    optimizer.zero_grad(set_to_none=True)
+    progress = tqdm(dataloader, desc=f"Graph train epoch {epoch + 1}", unit="batch", dynamic_ncols=True)
+    for batch_index, batch in enumerate(progress):
+        tensors = _to_device(batch, device)
+        rollout_transitions = []
+        model.eval()
+        for row, task_id in enumerate(batch["task_ids"]):
+            prefix_length = int(tensors["prefix_lengths"][row].item())
+            target_length = int(tensors["target_ids"][row].ne(IGNORE_INDEX).sum().item())
+            if prefix_length < 1 or target_length < 1:
+                raise ValueError(f"invalid graph-training sample {task_id}")
+            prompt = tensors["input_ids"][row : row + 1, :prefix_length]
+            search = model.search(
+                prompt,
+                prefix_lengths=prompt.new_tensor([prefix_length]),
+                search_config=search_config,
+                verifier=ARCDecodedVerifier(batch["target_grids"][row], shaping=True),
+                max_new_tokens=decode_max_new_tokens,
+                task_id=task_id,
+            )
+            if search.replay_transitions:
+                decoder_targets = tensors["target_ids"][row].detach()
+                for transition in search.replay_transitions:
+                    if transition.terminal:
+                        transition.decoder_target_ids = decoder_targets
+                rollout_transitions.extend(search.replay_transitions)
+            if search.selected_index is None or search.verified is None:
+                raise RuntimeError("training rollout is missing policy-selection diagnostics")
+            selected_exact += int(bool(search.verified[int(search.selected_index)]))
+            oracle_exact += int(any(search.verified))
+            rollout_count += 1
+        replay_buffer.extend(rollout_transitions)
+        replay_sample = (
+            list(rollout_transitions)
+            if ppo_clip is not None
+            else replay_buffer.sample(replay_batch_size)
+        )
+        if not replay_sample:
+            raise RuntimeError("graph rollout produced no replayable transitions")
+
+        model.train()
+        outputs = model(
+            **{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")},
+            use_cache=False,
+        )
+        if outputs.loss is None or not torch.isfinite(outputs.loss):
+            raise FloatingPointError(f"non-finite SFT anchor loss at graph epoch={epoch}, batch={batch_index}")
+        controller = getattr(getattr(model, "model", model), "state_controller")
+        policy_loss, policy_breakdown = compute_graph_policy_loss(
+            controller,
+            replay_sample,
+            device=device,
+            awr_temperature=awr_temperature,
+            max_advantage_weight=max_advantage_weight,
+            ppo_clip=ppo_clip,
+        )
+        local_loss = compute_local_transition_loss(
+            model,
+            replay_sample,
+            awr_temperature=awr_temperature,
+            max_advantage_weight=max_advantage_weight,
+        )
+        decoder_loss = compute_graph_decoder_loss(
+            model,
+            replay_sample,
+            awr_temperature=awr_temperature,
+            max_advantage_weight=max_advantage_weight,
+        )
+        kl_loss = outputs.loss.new_zeros(())
+        if reference_model is not None and kl_weight:
+            reference_model.eval()
+            with torch.no_grad():
+                reference_outputs = reference_model(
+                    **{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")},
+                    use_cache=False,
+                )
+            kl_mask = tensors["target_ids"].ne(IGNORE_INDEX)
+            kl_loss = F.kl_div(
+                outputs.logits[kl_mask].log_softmax(dim=-1),
+                reference_outputs.logits[kl_mask].softmax(dim=-1),
+                reduction="batchmean",
+            ).clamp_min(0.0)
+        total_loss = (
+            lm_weight * outputs.loss
+            + policy_weight * policy_loss
+            + local_bptt_weight * local_loss
+            + graph_decoder_weight * decoder_loss
+            + kl_weight * kl_loss
+        )
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(f"non-finite graph training loss at epoch={epoch}, batch={batch_index}")
+        total_loss.backward()
+        if max_grad_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            if not torch.isfinite(grad_norm):
+                raise FloatingPointError(f"non-finite graph gradient norm at global_step={global_step}")
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        update_router_biases(model, outputs.router_counts or ())
+        optimizer.zero_grad(set_to_none=True)
+        metrics.update_teacher_forced(outputs.logits.detach(), tensors["target_ids"])
+        graph_loss_sum += float(total_loss.detach().item())
+        policy_loss_sum += float(policy_loss.detach().item())
+        local_loss_sum += float(local_loss.detach().item())
+        decoder_loss_sum += float(decoder_loss.detach().item())
+        kl_loss_sum += float(kl_loss.detach().item())
+        if writer is not None:
+            writer.add_scalar("graph/total_loss", total_loss.item(), global_step)
+            writer.add_scalar("graph/policy_loss", policy_loss.item(), global_step)
+            writer.add_scalar("graph/local_bptt_loss", local_loss.item(), global_step)
+            writer.add_scalar("graph/decoder_grounding_loss", decoder_loss.item(), global_step)
+            writer.add_scalar("graph/reference_kl", kl_loss.item(), global_step)
+            writer.add_scalar("graph/replay_size", len(replay_buffer), global_step)
+            for name, value in policy_breakdown.items():
+                writer.add_scalar(f"graph/{name}", value.item(), global_step)
+        global_step += 1
+        graph_steps += 1
+        progress.set_postfix(
+            loss=f"{total_loss.item():.4f}",
+            selected=f"{selected_exact / rollout_count:.3f}",
+            oracle=f"{oracle_exact / rollout_count:.3f}",
+        )
+        if max_steps is not None and global_step >= max_steps:
+            break
+    if rollout_count == 0:
+        raise ValueError("graph training produced no rollouts")
+    steps = max(graph_steps, 1)
+    aggregate = metrics.as_dict()
+    aggregate.update({
+        "graph_total_loss": graph_loss_sum / steps,
+        "graph_policy_loss": policy_loss_sum / steps,
+        "graph_local_bptt_loss": local_loss_sum / steps,
+        "graph_decoder_grounding_loss": decoder_loss_sum / steps,
+        "graph_reference_kl": kl_loss_sum / steps,
+        "graph_policy_algorithm": 1.0 if ppo_clip is not None else 0.0,
+        "selected_solution_accuracy": selected_exact / rollout_count,
+        "oracle_success_at_n": oracle_exact / rollout_count,
+        "graph_rollouts": float(rollout_count),
+        "replay_size": float(len(replay_buffer)),
+    })
+    _write_metrics(writer, "graph_train", aggregate, global_step)
+    return global_step, aggregate, replay_buffer
+
+
 @torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
@@ -452,4 +660,7 @@ def validate(*args: Any, **kwargs: Any) -> float:
     return metrics["loss"]
 
 
-__all__ = ["ARCMetrics", "decode_arc_grid", "evaluate", "is_better_validation", "train_epoch", "validate", "validate_metrics"]
+__all__ = [
+    "ARCMetrics", "decode_arc_grid", "evaluate", "is_better_validation", "train_epoch",
+    "train_graph_epoch", "validate", "validate_metrics",
+]

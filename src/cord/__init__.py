@@ -3,12 +3,19 @@
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from .configuration_cord import CordConfig
+from .controller import CordControllerOutput, CordStateController
 from .modeling_cord import CordForCausalLM, CordModel, CordPreTrainedModel
 from .outputs import CordCausalLMOutputWithPast, CordConceptPacket, CordModelOutput, CordSearchOutput
 from .state_graph import CordDecodeContext, CordOperator, CordSearchConfig, CordVerifierResult
 from .training import (
     CordLossTargets,
+    CordGraphReplayBuffer,
+    CordGraphTransition,
     build_cord_optimizer_param_groups,
+    build_graph_optimizer_param_groups,
+    compute_graph_policy_loss,
+    compute_local_transition_loss,
+    compute_graph_decoder_loss,
     compute_cord_loss,
     update_router_biases,
 )
@@ -49,9 +56,17 @@ __all__ = [
     "CordSearchConfig",
     "CordDecodeContext",
     "CordVerifierResult",
+    "CordControllerOutput",
+    "CordStateController",
     "CordLossTargets",
+    "CordGraphTransition",
+    "CordGraphReplayBuffer",
     "compute_cord_loss",
+    "compute_graph_policy_loss",
+    "compute_local_transition_loss",
+    "compute_graph_decoder_loss",
     "build_cord_optimizer_param_groups",
+    "build_graph_optimizer_param_groups",
     "update_router_biases",
     "register_cord_auto_classes",
 ]

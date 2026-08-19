@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import copy
 
 import pytest
 
@@ -12,6 +13,7 @@ from trainer.trainer import (
     evaluate,
     is_better_validation,
     train_epoch,
+    train_graph_epoch,
     validate_metrics,
 )
 
@@ -257,3 +259,74 @@ def test_gradient_accumulation_matches_logical_batches_including_tail():
 
 # Keep torch imported for downstream evaluator stubs without constructing a full model here.
 assert SimpleNamespace and IGNORE_INDEX == -100 and PAD_TOKEN == 0
+
+
+def test_graph_training_epoch_consumes_verified_replay_and_updates_policy():
+    from cord import (
+        CordConfig, CordForCausalLM, CordGraphReplayBuffer, CordSearchConfig,
+        build_graph_optimizer_param_groups,
+    )
+
+    torch.manual_seed(3)
+    config = CordConfig(
+        vocab_size=16, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_decoder_layers=1, num_attention_heads=4, num_key_value_heads=2,
+        concept_slots=2, concept_num_attention_heads=4, concept_latent_size=8,
+        num_recurrent_loops=1, minimum_recurrent_loops=1, max_recurrent_loops=1,
+        num_kda_layers=1, num_mla_layers=0, num_experts=1, num_experts_per_token=1,
+        routed_latent_width=8, expert_intermediate_size=16, max_position_embeddings=16,
+    )
+    model = CordForCausalLM(config)
+    prompt = torch.tensor([[1, GRID_OFFSET, ROW_SEP, 14]])
+    target = torch.tensor([[GRID_OFFSET + 2, ROW_SEP, EOS_TOKEN]])
+    input_ids = torch.cat((prompt, target), dim=1)
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": torch.cat((torch.full_like(prompt, IGNORE_INDEX), target), dim=1),
+        "prefix_lengths": torch.tensor([prompt.shape[1]]),
+        "target_ids": target,
+        "target_grids": [[[2]]],
+        "task_ids": ["graph-unit"],
+        "query_indices": [0],
+    }
+    groups = build_graph_optimizer_param_groups(model, 1e-3, backbone_lr_scale=0.1)
+    optimizer = torch.optim.AdamW(groups)
+    replay = CordGraphReplayBuffer(32)
+    before = model.model.state_controller.parent_selector.weight.detach().clone()
+    step, metrics, replay = train_graph_epoch(
+        model,
+        [batch],
+        optimizer,
+        torch.device("cpu"),
+        search_config=CordSearchConfig(max_expansions=1, beam_size=2, max_verified_leaves=2),
+        replay_buffer=replay,
+        replay_batch_size=2,
+        decode_max_new_tokens=8,
+    )
+    after = model.model.state_controller.parent_selector.weight.detach()
+    assert step == 1 and len(replay) > 0
+    assert metrics["graph_rollouts"] == 1.0
+    assert metrics["replay_size"] > 0.0
+    assert not torch.equal(before, after)
+
+    reference = copy.deepcopy(model).eval()
+    for parameter in reference.parameters():
+        parameter.requires_grad_(False)
+    step, ppo_metrics, replay = train_graph_epoch(
+        model,
+        [batch],
+        optimizer,
+        torch.device("cpu"),
+        search_config=CordSearchConfig(max_expansions=1, beam_size=2, max_verified_leaves=2),
+        replay_buffer=replay,
+        replay_batch_size=2,
+        global_step=step,
+        decode_max_new_tokens=8,
+        ppo_clip=0.2,
+        reference_model=reference,
+        kl_weight=0.01,
+    )
+    assert step == 2
+    assert ppo_metrics["graph_policy_algorithm"] == 1.0
+    assert ppo_metrics["graph_reference_kl"] >= 0.0

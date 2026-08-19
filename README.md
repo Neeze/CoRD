@@ -59,3 +59,10 @@ The optional `kda` extra enables FLA kernels:
 ```bash
 uv sync --extra kda
 ```
+
+## Reward-guided graph training
+
+After establishing an SFT checkpoint, enable controller/value training and
+local recurrent replay with `--graph-training-epochs`. See
+`docs/reward_guided_state_graph_training.md` for the reward, credit-assignment,
+evaluation, and target-leakage contracts.
