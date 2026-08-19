@@ -56,14 +56,15 @@ echo "============================================================"
 
 # Environment variables for PyTorch & Hardware Optimization
 export DEVICE="${DEVICE:-cuda}"
-export BATCH_SIZE="${BATCH_SIZE:-2}"
-export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+export BATCH_SIZE="${BATCH_SIZE:-8}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+export NUM_WORKERS="${NUM_WORKERS:-4}"
 export PYTHONUNBUFFERED=1
 
 # PyTorch CUDA Memory Allocator optimization to prevent fragmentation
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Multi-threading tuning to avoid CPU over-subscription when num-workers=80 on EPYC
+# Multi-threading tuning to avoid CPU over-subscription in data-loader workers
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -77,6 +78,7 @@ echo "Configuration:"
 echo " - DEVICE: $DEVICE"
 echo " - BATCH_SIZE: $BATCH_SIZE"
 echo " - GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS (Effective Batch Size: $((BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)))"
+echo " - NUM_WORKERS: $NUM_WORKERS"
 echo " - PyTorch Allocator: $PYTORCH_CUDA_ALLOC_CONF"
 echo " - Python Binary: $PYTHON_BIN"
 
@@ -87,14 +89,4 @@ echo "============================================================"
 
 chmod +x "$SCRIPT_DIR/train_model.sh"
 
-exec "$SCRIPT_DIR/train_model.sh" \
-  --batch-size "${BATCH_SIZE}" \
-  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
-  --epochs 50 \
-  --num-aug 100 \
-  --learning-rate 2e-4 \
-  --weight-decay 0.1 \
-  --warmup-ratio 0.05 \
-  --max-grad-norm 1.0 \
-  --num-workers 80 \
-  "$@"
+exec "$SCRIPT_DIR/train_model.sh" "$@"

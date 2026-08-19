@@ -15,8 +15,13 @@ To automatically install `uv` (if needed), sync Python dependencies, tune enviro
 You can pass extra flags or override environment variables directly:
 
 ```bash
-DEVICE=cuda BATCH_SIZE=16 ./scripts/bash/setup_and_train.sh --epochs 50 --num-workers 80
+DEVICE=cuda BATCH_SIZE=8 ./scripts/bash/train_model.sh
 ```
+
+This defaults to 50 epochs, 4 augmentations, gradient accumulation 1,
+learning rate `2e-4`, weight decay `0.1`, warmup ratio `0.05`, max gradient
+norm `1.0`, and 4 data-loader workers. Every value can still be overridden by
+an environment variable or a later CLI argument.
 
 ## Project layout
 
