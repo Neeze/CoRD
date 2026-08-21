@@ -291,6 +291,42 @@ def _add_counts(accumulated: tuple[torch.Tensor, ...] | None, counts: tuple[torc
     return tuple(left + right for left, right in zip(accumulated, detached))
 
 
+def _distributed_router_counts(counts: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return counts
+    reduced = tuple(item.clone() for item in counts)
+    for item in reduced:
+        torch.distributed.all_reduce(item, op=torch.distributed.ReduceOp.SUM)
+    return reduced
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "module", model)
+
+
+def synchronize_gradients(model: torch.nn.Module) -> None:
+    """Synchronize graph-training gradients computed outside DDP.forward()."""
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    world_size = torch.distributed.get_world_size()
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(parameter)
+        torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
+        parameter.grad.div_(world_size)
+
+
+def _hide_nonzero_rank_progress() -> bool:
+    return (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    )
+
+
 def train_epoch(
     model: torch.nn.Module,
     dataloader: Iterable[dict[str, Any]],
@@ -313,6 +349,7 @@ def train_epoch(
     optimizer.zero_grad(set_to_none=True)
     start = time.monotonic()
     microbatches = 0
+    input_token_count = 0
     progress_total = len(dataloader) if hasattr(dataloader, "__len__") else None
     if max_steps is not None and progress_total is not None:
         remaining_steps = max(max_steps - global_step, 0)
@@ -323,9 +360,13 @@ def train_epoch(
         desc=f"Train epoch {epoch + 1}",
         unit="batch",
         dynamic_ncols=True,
+        disable=_hide_nonzero_rank_progress(),
+        position=1,
+        leave=False,
     )
     for batch_index, batch in enumerate(progress):
         tensors = _to_device(batch, device)
+        input_token_count += int(tensors["attention_mask"].sum().item())
         outputs = model(**{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")}, use_cache=False)
         if outputs.loss is None or not torch.isfinite(outputs.loss):
             raise FloatingPointError(f"non-finite training loss at epoch={epoch}, batch={batch_index}")
@@ -347,7 +388,7 @@ def train_epoch(
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        update_router_biases(model, router_counts or ())
+        update_router_biases(_unwrap_model(model), _distributed_router_counts(router_counts or ()))
         router_counts = None
         optimizer.zero_grad(set_to_none=True)
         if writer is not None:
@@ -363,6 +404,7 @@ def train_epoch(
         if max_steps is not None and global_step >= max_steps:
             break
     aggregate = metrics.as_dict()
+    aggregate["input_tokens"] = float(input_token_count)
     aggregate["tokens_per_second"] = metrics.token_count / max(time.monotonic() - start, 1e-9)
     _write_metrics(writer, "train", aggregate, global_step)
     return global_step, aggregate
@@ -425,19 +467,25 @@ def train_graph_epoch(
     oracle_exact = 0
     rollout_count = 0
     graph_steps = 0
+    input_token_count = 0
     optimizer.zero_grad(set_to_none=True)
-    progress = tqdm(dataloader, desc=f"Graph train epoch {epoch + 1}", unit="batch", dynamic_ncols=True)
+    progress = tqdm(
+        dataloader, desc=f"Graph train epoch {epoch + 1}", unit="batch",
+        dynamic_ncols=True, disable=_hide_nonzero_rank_progress(), position=1, leave=False,
+    )
     for batch_index, batch in enumerate(progress):
         tensors = _to_device(batch, device)
+        input_token_count += int(tensors["attention_mask"].sum().item())
         rollout_transitions = []
-        model.eval()
+        graph_model = _unwrap_model(model)
+        graph_model.eval()
         for row, task_id in enumerate(batch["task_ids"]):
             prefix_length = int(tensors["prefix_lengths"][row].item())
             target_length = int(tensors["target_ids"][row].ne(IGNORE_INDEX).sum().item())
             if prefix_length < 1 or target_length < 1:
                 raise ValueError(f"invalid graph-training sample {task_id}")
             prompt = tensors["input_ids"][row : row + 1, :prefix_length]
-            search = model.search(
+            search = graph_model.search(
                 prompt,
                 prefix_lengths=prompt.new_tensor([prefix_length]),
                 search_config=search_config,
@@ -465,14 +513,14 @@ def train_graph_epoch(
         if not replay_sample:
             raise RuntimeError("graph rollout produced no replayable transitions")
 
-        model.train()
-        outputs = model(
+        graph_model.train()
+        outputs = graph_model(
             **{key: tensors[key] for key in ("input_ids", "attention_mask", "labels", "prefix_lengths")},
             use_cache=False,
         )
         if outputs.loss is None or not torch.isfinite(outputs.loss):
             raise FloatingPointError(f"non-finite SFT anchor loss at graph epoch={epoch}, batch={batch_index}")
-        controller = getattr(getattr(model, "model", model), "state_controller")
+        controller = getattr(getattr(graph_model, "model", graph_model), "state_controller")
         policy_loss, policy_breakdown = compute_graph_policy_loss(
             controller,
             replay_sample,
@@ -482,13 +530,13 @@ def train_graph_epoch(
             ppo_clip=ppo_clip,
         )
         local_loss = compute_local_transition_loss(
-            model,
+            graph_model,
             replay_sample,
             awr_temperature=awr_temperature,
             max_advantage_weight=max_advantage_weight,
         )
         decoder_loss = compute_graph_decoder_loss(
-            model,
+            graph_model,
             replay_sample,
             awr_temperature=awr_temperature,
             max_advantage_weight=max_advantage_weight,
@@ -517,14 +565,15 @@ def train_graph_epoch(
         if not torch.isfinite(total_loss):
             raise FloatingPointError(f"non-finite graph training loss at epoch={epoch}, batch={batch_index}")
         total_loss.backward()
+        synchronize_gradients(graph_model)
         if max_grad_norm is not None:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(graph_model.parameters(), max_grad_norm)
             if not torch.isfinite(grad_norm):
                 raise FloatingPointError(f"non-finite graph gradient norm at global_step={global_step}")
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        update_router_biases(model, outputs.router_counts or ())
+        update_router_biases(graph_model, _distributed_router_counts(outputs.router_counts or ()))
         optimizer.zero_grad(set_to_none=True)
         metrics.update_teacher_forced(outputs.logits.detach(), tensors["target_ids"])
         graph_loss_sum += float(total_loss.detach().item())
@@ -565,6 +614,7 @@ def train_graph_epoch(
         "oracle_success_at_n": oracle_exact / rollout_count,
         "graph_rollouts": float(rollout_count),
         "replay_size": float(len(replay_buffer)),
+        "input_tokens": float(input_token_count),
     })
     _write_metrics(writer, "graph_train", aggregate, global_step)
     return global_step, aggregate, replay_buffer
@@ -593,6 +643,9 @@ def evaluate(
         desc=f"Evaluate {namespace}",
         unit="batch",
         dynamic_ncols=True,
+        disable=_hide_nonzero_rank_progress(),
+        position=1,
+        leave=False,
     )
     for batch_index, batch in enumerate(progress):
         tensors = _to_device(batch, device)

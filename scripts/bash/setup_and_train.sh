@@ -55,8 +55,6 @@ echo " [3/4] Configuring High-Performance Hardware Optimizations"
 echo "============================================================"
 
 # Environment variables for PyTorch & Hardware Optimization
-export DEVICE="${DEVICE:-cuda}"
-export BATCH_SIZE="${BATCH_SIZE:-8}"
 export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
 export PYTHONUNBUFFERED=1
@@ -75,9 +73,7 @@ export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 export PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
 
 echo "Configuration:"
-echo " - DEVICE: $DEVICE"
-echo " - BATCH_SIZE: $BATCH_SIZE"
-echo " - GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS (Effective Batch Size: $((BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)))"
+echo " - GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS"
 echo " - NUM_WORKERS: $NUM_WORKERS"
 echo " - PyTorch Allocator: $PYTORCH_CUDA_ALLOC_CONF"
 echo " - Python Binary: $PYTHON_BIN"

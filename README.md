@@ -15,13 +15,36 @@ To automatically install `uv` (if needed), sync Python dependencies, tune enviro
 You can pass extra flags or override environment variables directly:
 
 ```bash
-DEVICE=cuda BATCH_SIZE=8 ./scripts/bash/train_model.sh
+./scripts/bash/train_model.sh --strategy single --devices 0 --batch-size 8
 ```
 
 This defaults to 50 epochs, 4 augmentations, gradient accumulation 1,
 learning rate `2e-4`, weight decay `0.1`, warmup ratio `0.05`, max gradient
-norm `1.0`, and 4 data-loader workers. Every value can still be overridden by
-an environment variable or a later CLI argument.
+norm `1.0`, and 4 data-loader workers. `--batch-size`, `--strategy`, and
+`--devices` are explicit CLI flags; later CLI arguments override wrapper defaults.
+
+For native DDP (the batch size is per GPU):
+
+```bash
+./scripts/bash/train_model.sh \
+  --strategy ddp \
+  --devices 0 1 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 2
+```
+
+This plain invocation relaunches itself through `torchrun`. The example has an
+effective batch size of `2 × 2 GPUs × 2 accumulation = 8`. DDP shards the
+training dataset, synchronizes model gradients and router statistics, and only
+rank zero evaluates, logs, and writes checkpoints. `fsdp` and
+`deepspeed_stage_3` are reserved strategy names and currently fail explicitly
+because graph replay is not yet compatible with their parameter sharding.
+
+Before optimization starts, the trainer prints a manifest containing input,
+prefix, and supervised tokens per epoch; scheduled totals; graph-decode token
+budget; optimizer steps; and effective global batch size. Rank zero also keeps
+one overall `SFT > AWR > PPO` progress bar with the active segment and actual
+processed input-token count, while the transient per-epoch bar remains below it.
 
 ## Project layout
 

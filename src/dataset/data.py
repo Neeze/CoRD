@@ -253,12 +253,18 @@ class ARCDataset(Dataset):
             sample = self[index]
             values.append((sample["prefix_length"], sample["target_ids"].numel(), sample["input_ids"].numel()))
         if not values:
-            return {"samples": 0, "max_prefix": 0, "max_target": 0, "max_total": 0}
+            return {
+                "samples": 0, "max_prefix": 0, "max_target": 0, "max_total": 0,
+                "prefix_tokens": 0, "supervised_tokens": 0, "total_tokens": 0,
+            }
         return {
             "samples": len(values),
             "max_prefix": max(value[0] for value in values),
             "max_target": max(value[1] for value in values),
             "max_total": max(value[2] for value in values),
+            "prefix_tokens": sum(value[0] for value in values),
+            "supervised_tokens": sum(value[1] for value in values),
+            "total_tokens": sum(value[2] for value in values),
         }
 
     def __len__(self) -> int:

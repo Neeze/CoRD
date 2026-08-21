@@ -43,6 +43,6 @@ The distinction is deliberate: teacher forcing measures token prediction under t
 
 ## Remaining scale-up gaps
 
-The 50M pipeline implements phase-one search distillation/AWR, Monte Carlo value targets, uncertainty calibration, learned halt actions, replay, and local truncated BPTT. Clipped PPO is available as a loss mode but is deliberately not the default before value calibration. Remaining scale-up work includes truly bounded cold storage across unlimited archive depth, Muon, distributed/expert-parallel reduction, production fused attention/KDA kernels, and empirical calibration at sufficient rollout volume.
+The 50M pipeline implements phase-one search distillation/AWR, Monte Carlo value targets, uncertainty calibration, learned halt actions, replay, and local truncated BPTT. Clipped PPO is available as a loss mode but is deliberately not the default before value calibration. Native DDP supports SFT and graph phases with distributed sampling, gradient/router-stat synchronization, and rank-zero evaluation/checkpointing. Remaining scale-up work includes truly bounded cold storage across unlimited archive depth, Muon, FSDP/DeepSpeed and expert-parallel sharding, production fused attention/KDA kernels, and empirical calibration at sufficient rollout volume.
 
 Value, uncertainty, halt, and policy diagnostics become meaningful only after graph training; randomly initialized heads from an SFT-only checkpoint are still uncalibrated.
